@@ -1,53 +1,93 @@
 # FM-Mesh-ESP32
 
-Σύστημα **mesh επικοινωνίας μηνυμάτων πάνω από αναλογικούς FM πομποδέκτες**,\nβασισμένο σε ESP32 (Arduino) και εμπνευσμένο από το Meshtastic.
+Σύστημα **mesh επικοινωνίας μηνυμάτων πάνω από αναλογικούς FM πομποδέκτες**,
+βασισμένο σε ESP32 (Arduino) και εμπνευσμένο από το Meshtastic.
 
-Το project υλοποιεί **πλήρως custom πρωτόκολλο** (όχι APRS, όχι AX.25, όχι LoRa)\nκαι επιτρέπει **offline επικοινωνία, chat, και mesh forwarding** χωρίς internet.
+Το project υλοποιεί **πλήρως custom πρωτόκολλο** (όχι APRS, όχι AX.25, όχι LoRa)
+και επιτρέπει **offline επικοινωνία, chat και mesh forwarding** χωρίς internet.
 
 ---
 
 ## ✨ Χαρακτηριστικά
 
-- 📡 Mesh networking (store & forward)\n- 🔗 Custom 2-FSK modem πάνω από FM\n- 🗣️ Συμβατό με οποιοδήποτε FM walkie-talkie\n- 📨 Broadcast μηνύματα (χωρίς encryption)\n- 🔐 Direct μηνύματα (AES encryption)\n- 🔁 ACK + retry μηχανισμός\n- 🧠 Dedupe (seen table)\n- 🌐 WiFi SoftAP API (ESP32 ↔ PC χωρίς router)\n- ⚙️ Arduino-first firmware\n- 📱 BLE-ready (μελλοντικά)
+- 📡 Mesh networking (store & forward)
+- 🔗 Custom 2-FSK modem πάνω από FM
+- 🗣️ Συμβατό με οποιοδήποτε FM walkie-talkie
+- 📨 Broadcast μηνύματα (χωρίς encryption)
+- 🔐 Direct μηνύματα (AES encryption)
+- 🔁 ACK + retry μηχανισμός
+- 🧠 Dedupe (seen table)
+- 🌐 WiFi SoftAP API (ESP32 ↔ PC χωρίς router)
+- ⚙️ Arduino-first firmware
+- 📱 BLE-ready (μελλοντικά)
 
 ---
 
 ## ❌ Τι ΔΕΝ είναι
 
-- Δεν είναι APRS\n- Δεν είναι AX.25\n- Δεν είναι LoRa\n- Δεν είναι FT8 / FT4\n- Δεν απαιτεί internet
+- Δεν είναι APRS
+- Δεν είναι AX.25
+- Δεν είναι LoRa
+- Δεν είναι FT8 / FT4
+- Δεν απαιτεί internet
 
 ---
 
 ## 🧱 Αρχιτεκτονική
 
-(Περιγραφή αρχιτεκτονικής — πρόσθεσε εδώ διάγραμμα/περίληψη για nodes, modem layer, routing/store-and-forward, API και αποθήκευση μηνυμάτων.)
-
-[ PC / Web / BLE App ]\n│\n▼\n[ WiFi SoftAP API ]\n│\n▼\n[ Mesh Layer ]\n│\n▼\n[ 2-FSK Modem ]\n│\n▼\n[ Αναλογικός FM Πομποδέκτης ]
+[ PC / Web / BLE App ]
+│
+▼
+[ WiFi SoftAP API ]
+│
+▼
+[ Mesh Layer ]
+│
+▼
+[ 2-FSK Modem ]
+│
+▼
+[ Αναλογικός FM Πομποδέκτης ]
 
 
 ---
 
 ## 🔧 Hardware
 
-- ESP32-C3 Mini (Waveshare δοκιμασμένο)\n- Quansheng UV-K1 / UV-K5 (K-plug)\n- Optocoupler για PTT\n- 2 αντιστάσεις + 1 πυκνωτής για audio
+- ESP32-C3 Mini (Waveshare δοκιμασμένο)
+- Quansheng UV-K1 / UV-K5 (K-plug)
+- Optocoupler για PTT
+- 2 αντιστάσεις + 1 πυκνωτής για audio
 
-Δες **hardware/** για σχέδια.
+Δες τον φάκελο **hardware/** για σχέδια.
 
 ---
 
 ## 🌐 WiFi API
 
-SSID: `FM-MESH`  \nPASS: `mesh1234`  \nIP: `192.168.4.1`
+SSID: `FM-MESH`  
+PASS: `mesh1234`  
+IP: `192.168.4.1`
 
-Endpoints:
+### Endpoints
 
-GET /api/status\nPOST /api/send\nGET /api/messages\n+ Όλα απαιτούν API key.
+GET /api/status
+POST /api/send
+GET /api/messages
 
-+ ---
+
+> Όλα απαιτούν API key.
+
+---
 
 ## 🚀 Γρήγορη Εκκίνηση
 
-1. Άνοιξε `firmware/fm_mesh_esp32/` στο Arduino IDE\n2. Επίλεξε board: **ESP32C3 Dev Module**\n3. Ρύθμισε `config.h`\n4. Upload\n5. Συνδέσου στο WiFi\n6. Στείλε μήνυμα 🎉
+1. Άνοιξε `firmware/fm_mesh_esp32/` στο Arduino IDE  
+2. Επίλεξε board: **ESP32C3 Dev Module**  
+3. Ρύθμισε το `config.h`  
+4. Upload στο ESP32  
+5. Συνδέσου στο WiFi  
+6. Στείλε μήνυμα 🎉
 
 ---
 
