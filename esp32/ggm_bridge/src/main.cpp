@@ -5,11 +5,22 @@
 // (http://192.168.4.1) and to a PC over the USB serial console.
 //
 // Serial console (115200, USB): "call SV4QXF", "send ALL hello", "send SV4ABC hi there", "status", "wifi on|off".
+//
+// GGM_SIM_RADIO=1 builds a bench version with no radio: the "air" is ESP-NOW broadcast between boards on WiFi
+// channel 1, each frame tagged with the sending node's callsign. Console "deaf CALL" / "hear CALL" makes this node
+// ignore / hear one station again, to build relay topologies on a desk (A deaf to C and C deaf to A = A-B-C line).
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <esp_random.h>
+#ifndef GGM_SIM_RADIO
+#define GGM_SIM_RADIO 0
+#endif
+#if GGM_SIM_RADIO
+#include <esp_now.h>
+#include <esp_wifi.h>
+#endif
 
 extern "C" {
 #include "messenger/msg_packet.h"
@@ -29,6 +40,11 @@ extern "C" {
 #endif
 
 static HardwareSerial radio(1);
+#if GGM_SIM_RADIO
+#define SIM_AIR_MS 900			// one GGM2 burst on air: the next frame waits this long, like the real radio
+static void sim_send(const uint8_t p[MSG_PKT_WIRE_LEN]);
+static uint32_t sim_air_free_ms;
+#endif
 static WebServer web(80);
 static Preferences prefs;
 
@@ -186,6 +202,14 @@ static void txq_pop()
 
 static void txq_pump(uint32_t now)
 {
+#if GGM_SIM_RADIO
+	if (txq_count && (int32_t)(now - sim_air_free_ms) >= 0) {
+		sim_send(txq[txq_head]);
+		sim_air_free_ms = now + SIM_AIR_MS;
+		txq_pop();
+	}
+	return;
+#endif
 	if (tx_in_flight) {
 		if (now - tx_since > 5000) {		// no result: the radio lost it
 			tx_failures++;
@@ -235,6 +259,90 @@ static void on_tx_result(const msg_link_event_t &ev, uint32_t now)
 		break;
 	}
 }
+
+// ---- simulated air (GGM_SIM_RADIO) --------------------------------------------------------------------------------
+#if GGM_SIM_RADIO
+#define SIM_RXQ 8
+#define SIM_DEAF_MAX 6
+struct SimFrame {
+	char tx_call[MSG_CALLSIGN_LEN];		// who keyed up (relays included), for the deaf list
+	uint8_t packet[MSG_PKT_WIRE_LEN];
+};
+static SimFrame sim_rxq[SIM_RXQ];
+static int8_t sim_rxq_rssi[SIM_RXQ];
+static volatile uint8_t sim_rx_head, sim_rx_tail;	// WiFi task produces, loop() consumes
+static char sim_deaf[SIM_DEAF_MAX][MSG_CALLSIGN_LEN + 1];
+static const uint8_t SIM_BCAST[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+static void sim_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+	if (len != (int)sizeof(SimFrame)) {
+		return;
+	}
+	uint8_t next = (uint8_t)((sim_rx_head + 1) % SIM_RXQ);
+	if (next == sim_rx_tail) {
+		return;					// full: lost, like a collision
+	}
+	memcpy(&sim_rxq[sim_rx_head], data, sizeof(SimFrame));
+	sim_rxq_rssi[sim_rx_head] = (int8_t)(info->rx_ctrl ? info->rx_ctrl->rssi : -50);
+	sim_rx_head = next;
+}
+
+static bool sim_is_deaf(const char *call)
+{
+	for (int i = 0; i < SIM_DEAF_MAX; i++) {
+		if (sim_deaf[i][0] && strncmp(sim_deaf[i], call, MSG_CALLSIGN_LEN) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void sim_set_deaf(const char *call, bool deaf)
+{
+	for (int i = 0; i < SIM_DEAF_MAX; i++) {
+		if (sim_deaf[i][0] && strncmp(sim_deaf[i], call, MSG_CALLSIGN_LEN) == 0) {
+			if (!deaf) {
+				sim_deaf[i][0] = 0;
+			}
+			return;
+		}
+	}
+	for (int i = 0; deaf && i < SIM_DEAF_MAX; i++) {
+		if (!sim_deaf[i][0]) {
+			strlcpy(sim_deaf[i], call, sizeof sim_deaf[i]);
+			return;
+		}
+	}
+}
+
+static void sim_start()
+{
+	if (esp_now_init() != ESP_OK) {
+		Serial.println("ESP-NOW init failed");
+		return;
+	}
+	esp_now_register_recv_cb(sim_recv);
+	esp_now_peer_info_t peer = {};
+	memcpy(peer.peer_addr, SIM_BCAST, 6);
+	peer.channel = 0;			// the AP's channel
+	peer.ifidx = WIFI_IF_AP;
+	peer.encrypt = false;
+	esp_now_add_peer(&peer);
+	radio_attached = true;
+	radio_caps = MSG_LINK_CAP_TX;
+	strlcpy(radio_call, "SIM", sizeof radio_call);
+}
+
+static void sim_send(const uint8_t p[MSG_PKT_WIRE_LEN])
+{
+	SimFrame f;
+	memset(&f, 0, sizeof f);
+	memcpy(f.tx_call, own_call, strnlen(own_call, MSG_CALLSIGN_LEN));
+	memcpy(f.packet, p, MSG_PKT_WIRE_LEN);
+	esp_now_send(SIM_BCAST, (const uint8_t *)&f, sizeof f);
+}
+#endif
 
 // ---- mesh ---------------------------------------------------------------------------------------------------------
 static msg_mesh_t mesh;
@@ -330,6 +438,18 @@ static void set_call(const char *c)
 
 static void link_poll(uint32_t now)
 {
+#if GGM_SIM_RADIO
+	while (sim_rx_tail != sim_rx_head) {
+		uint8_t i = sim_rx_tail;
+		char tx_call[MSG_CALLSIGN_LEN + 1] = {};
+		memcpy(tx_call, sim_rxq[i].tx_call, MSG_CALLSIGN_LEN);
+		if (!sim_is_deaf(tx_call)) {
+			msg_mesh_on_rx(&mesh, sim_rxq[i].packet, sim_rxq_rssi[i], now);
+		}
+		sim_rx_tail = (uint8_t)((i + 1) % SIM_RXQ);
+	}
+	return;
+#endif
 	while (radio.available()) {
 		uint16_t n = msg_kiss_rx_byte(&krx, (uint8_t)radio.read());
 		if (!n) {
@@ -538,9 +658,9 @@ static void api_call()
 
 static void wifi_start()
 {
-	WiFi.mode(WIFI_AP);
+	WiFi.mode(GGM_SIM_RADIO ? WIFI_AP_STA : WIFI_AP);
 	String ssid = String("GGM-") + own_call;
-	WiFi.softAP(ssid.c_str(), ap_pass);
+	WiFi.softAP(ssid.c_str(), ap_pass, 1);		// channel 1: the simulated air needs every node on one channel
 	// Low TX power: the phone is a meter away, and less 2.4 GHz energy inside the radio is better for its receiver
 	WiFi.setTxPower(WIFI_POWER_8_5dBm);
 	web.on("/", [] { web.send_P(200, "text/html", PAGE); });
@@ -584,8 +704,29 @@ static void console_line(char *line)
 			"suppressed %u, duplicates %u\n", own_call, radio_attached ? "attached" : "absent", radio_call,
 			txq_count, (unsigned long)tx_failures, (unsigned long)link_errors, mesh.relayed, mesh.suppressed,
 			mesh.duplicates);
+#if GGM_SIM_RADIO
+	} else if (!strcmp(cmd, "deaf") || !strcmp(cmd, "hear")) {
+		char *c = strtok(nullptr, " ");
+		if (c) {
+			for (char *q = c; *q; q++) {
+				*q = (char)toupper((unsigned char)*q);
+			}
+			sim_set_deaf(c, cmd[0] == 'd');
+		}
+		Serial.print("deaf to:");
+		for (int i = 0; i < SIM_DEAF_MAX; i++) {
+			if (sim_deaf[i][0]) {
+				Serial.printf(" %s", sim_deaf[i]);
+			}
+		}
+		Serial.println();
+#endif
 	} else if (!strcmp(cmd, "wifi")) {
 		char *a = strtok(nullptr, " ");
+		if (GGM_SIM_RADIO) {
+			Serial.println("the simulated air needs WiFi: always on");
+			return;
+		}
 		if (a) {
 			bool on = !strcmp(a, "on");
 			if (on != wifi_on) {
@@ -596,7 +737,8 @@ static void console_line(char *line)
 		}
 		Serial.printf("wifi %s\n", wifi_on ? "on" : "off");
 	} else {
-		Serial.println("commands: call <CALL> | send <TO|ALL> <text> | status | wifi on|off");
+		Serial.println(GGM_SIM_RADIO ? "commands: call <CALL> | send <TO|ALL> <text> | status | deaf <CALL> | hear <CALL>"
+					     : "commands: call <CALL> | send <TO|ALL> <text> | status | wifi on|off");
 	}
 }
 
@@ -625,9 +767,16 @@ void setup()
 	radio.begin(GGM_LINK_BAUD, SERIAL_8N1, GGM_LINK_RX, GGM_LINK_TX);
 	msg_kiss_rx_init(&krx);
 	mesh_setup();
+	if (GGM_SIM_RADIO) {
+		wifi_on = true;
+	}
 	if (wifi_on) {
 		wifi_start();
 	}
+#if GGM_SIM_RADIO
+	sim_start();
+	Serial.println("SIMULATED RADIO: frames go over ESP-NOW, no RF");
+#endif
 	Serial.printf("GGM mesh host, call %s, radio UART %d baud (RX %d, TX %d)\n", own_call, GGM_LINK_BAUD,
 		GGM_LINK_RX, GGM_LINK_TX);
 }
