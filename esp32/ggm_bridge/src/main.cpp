@@ -13,9 +13,13 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <Wire.h>
 #include <esp_random.h>
 #ifndef GGM_SIM_RADIO
 #define GGM_SIM_RADIO 0
+#endif
+#ifndef GGM_I2C_SCAN_AT_BOOT
+#define GGM_I2C_SCAN_AT_BOOT 0
 #endif
 #if GGM_SIM_RADIO
 #include <esp_now.h>
@@ -678,6 +682,42 @@ static void wifi_stop()
 	WiFi.mode(WIFI_OFF);
 }
 
+// ---- I2C scan (find the board's display: SSD1306/SH1106 OLEDs answer at 0x3C/0x3D) --------------------------------
+static void i2c_scan()
+{
+	static const struct { int sda, scl, rst; } buses[] = {
+		{ 4, 15, 16 },	// TTGO ESP32 OLED boards (reset on GPIO16)
+		{ 21, 22, -1 },	// the usual ESP32 I2C pins
+		{ 5, 4, -1 },	// some WEMOS-style OLED boards
+	};
+#if CONFIG_IDF_TARGET_ESP32
+	for (const auto &b : buses) {
+		if (b.rst >= 0) {
+			pinMode(b.rst, OUTPUT);	// hold an OLED's reset high so it can answer
+			digitalWrite(b.rst, LOW);
+			delay(5);
+			digitalWrite(b.rst, HIGH);
+			delay(5);
+		}
+		Wire.begin(b.sda, b.scl, 100000);
+		Serial.printf("I2C SDA%d/SCL%d:", b.sda, b.scl);
+		int found = 0;
+		for (uint8_t a = 0x08; a < 0x78; a++) {
+			Wire.beginTransmission(a);
+			if (Wire.endTransmission() == 0) {
+				Serial.printf(" 0x%02X", a);
+				found++;
+			}
+		}
+		Serial.println(found ? "" : " nothing");
+		Wire.end();
+	}
+#else
+	(void)buses;
+	Serial.println("i2c scan: classic ESP32 boards only");
+#endif
+}
+
 // ---- USB console --------------------------------------------------------------------------------------------------
 static void console_line(char *line)
 {
@@ -699,6 +739,8 @@ static void console_line(char *line)
 		} else {
 			Serial.println("usage: send <TO|ALL> <text>");
 		}
+	} else if (!strcmp(cmd, "i2c")) {
+		i2c_scan();
 	} else if (!strcmp(cmd, "status")) {
 		Serial.printf("call %s, radio %s (%s), queue %u, tx failures %lu, link errors %lu, relayed %u, "
 			"suppressed %u, duplicates %u\n", own_call, radio_attached ? "attached" : "absent", radio_call,
@@ -776,6 +818,9 @@ void setup()
 #if GGM_SIM_RADIO
 	sim_start();
 	Serial.println("SIMULATED RADIO: frames go over ESP-NOW, no RF");
+#endif
+#if GGM_I2C_SCAN_AT_BOOT
+	i2c_scan();
 #endif
 	Serial.printf("GGM mesh host, call %s, radio UART %d baud (RX %d, TX %d)\n", own_call, GGM_LINK_BAUD,
 		GGM_LINK_RX, GGM_LINK_TX);

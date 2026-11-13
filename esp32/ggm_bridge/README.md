@@ -17,9 +17,12 @@ pio device monitor                # console: call SV4QXF / send ALL hello / stat
 |---|---|---|
 | `xiao_c3` | Seeed XIAO ESP32-C3 | UART link (inside the radio) |
 | `ttgo` | TTGO/LilyGO with a classic ESP32 (T-Display, LoRa32 v2.x, T-Beam) | UART link, on the K-plug cable |
-| `ttgo_sim`, `xiao_c3_sim` | same boards | none: simulated air over ESP-NOW |
+| `ttgo_oled` | 2017 TTGO ESP32 with a display, CP2104, no LoRa (UART on GPIO26 TX / GPIO25 RX) | UART link |
+| `ttgo_sim`, `ttgo_oled_sim`, `xiao_c3_sim` | same boards | none: simulated air over ESP-NOW |
 
-All four are compile-checked against arduino-esp32 3.0.7 (-Wall -Wextra, no warnings). None is linked through
+The `ttgo_oled` envs print an I2C scan at boot (console `i2c` repeats it) so the display can be identified.
+
+All envs are compile-checked against arduino-esp32 3.0.7 (-Wall -Wextra, no warnings). None is linked through
 PlatformIO or flashed yet.
 
 ## Bench test without a radio (`ttgo_sim`)
