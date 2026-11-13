@@ -1,0 +1,2080 @@
+From 06145242092a3d67040b3e40c2fab81eebba189a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 13 Nov 2026 21:31:43 +0200
+Subject: [PATCH] messenger: UART link (KISS port 1) and host-side GGM2 mesh
+
+The radio offers its BK4819 GGM2 modem to a host on the programming UART
+(core/messenger/msg_bridge, docs/spec/messenger-link.md): every valid frame
+goes to the host with its RSSI, the host's packets are validated and keyed,
+and while the host is attached the radio sends no ACK of its own. Silence
+for 15 s returns it to standalone behavior.
+
+msg_mesh is the host's side (an ESP32 inside the radio): dedup on
+(from, id, type), slotted relays with suppression, ACKs that travel back
+over relays, retries. msg_link is the host's encoder/decoder. All portable C
+with host tests (make -f boards/rt880/Makefile test-msg).
+
+RT-880: LINK=1 (with MSG=1) builds it in; boards/rt880/link_uart.c is still
+an inert stub until the programming-cable USART is traced. Untested on the
+radio.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013Y8oYMpHjQAhBgzLpHHNXa
+---
+ boards/rt880/Makefile                |  12 ++
+ boards/rt880/link_uart.c             |  31 +++
+ boards/rt880/link_uart.h             |  15 ++
+ boards/rt880/radio.c                 |  99 ++++++++-
+ core/messenger/msg_bridge.c          | 262 ++++++++++++++++++++++++
+ core/messenger/msg_bridge.h          |  57 ++++++
+ core/messenger/msg_kiss.c            |  99 +++++++++
+ core/messenger/msg_kiss.h            |  41 ++++
+ core/messenger/msg_link.c            |  95 +++++++++
+ core/messenger/msg_link.h            | 100 ++++++++++
+ core/messenger/msg_mesh.c            | 288 +++++++++++++++++++++++++++
+ core/messenger/msg_mesh.h            | 110 ++++++++++
+ core/messenger/msg_packet.c          |  22 +-
+ core/messenger/msg_packet.h          |   9 +
+ core/messenger/tests/msg_link_test.c | 214 ++++++++++++++++++++
+ core/messenger/tests/msg_mesh_test.c | 259 ++++++++++++++++++++++++
+ docs/spec/messenger-link.md          | 133 +++++++++++++
+ 17 files changed, 1836 insertions(+), 10 deletions(-)
+ create mode 100644 boards/rt880/link_uart.c
+ create mode 100644 boards/rt880/link_uart.h
+ create mode 100644 core/messenger/msg_bridge.c
+ create mode 100644 core/messenger/msg_bridge.h
+ create mode 100644 core/messenger/msg_kiss.c
+ create mode 100644 core/messenger/msg_kiss.h
+ create mode 100644 core/messenger/msg_link.c
+ create mode 100644 core/messenger/msg_link.h
+ create mode 100644 core/messenger/msg_mesh.c
+ create mode 100644 core/messenger/msg_mesh.h
+ create mode 100644 core/messenger/tests/msg_link_test.c
+ create mode 100644 core/messenger/tests/msg_mesh_test.c
+ create mode 100644 docs/spec/messenger-link.md
+
+diff --git a/boards/rt880/Makefile b/boards/rt880/Makefile
+index 374ca4c..4741ece 100644
+--- a/boards/rt880/Makefile
++++ b/boards/rt880/Makefile
+@@ -45,6 +45,10 @@ endif
+ ifeq ($(MSG),1)
+ DIRS += core/messenger
+ TARGET := $(BUILD)/rfoundry_rt880_MSG_UNTESTED
++# LINK=1 (with MSG=1): the messenger link on the programming UART, for an ESP32 mesh host (docs/bridge-protocol.md)
++ifeq ($(LINK),1)
++TARGET := $(BUILD)/rfoundry_rt880_MSG_LINK_UNTESTED
++endif
+ endif
+ SRC := $(foreach d,$(DIRS),$(wildcard $(d)/*.c))
+ SRC := $(filter-out core/app/task_stack.c core/app/watchdog.c,$(SRC))
+@@ -54,6 +58,7 @@ OBJ := $(addprefix $(BUILD)/,$(SRC:.c=.o)) $(BUILD)/platform/at32f423/startup.o
+ CPU := -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+ DEFS := $(FEATURE_DEFS) $(HF_DEFS) -DGFX_INDEXED=1 -DGFX_FB_BYTES=9600u -DGFX_MAX_ROWS=160u \
+ 	-DCONFIG_MESSENGER=$(if $(filter 1,$(MSG)),1,0) \
++	-DCONFIG_MESSENGER_LINK=$(if $(filter 1,$(LINK)),1,0) \
+ 	-DRFOUNDRY_BOARD_ID=\"rt880-lab\" -DRFOUNDRY_GIT=\"private-lab\"
+ INC := -Ihal -Icore -Idrivers -Iboards/rt880 -Iplatform/at32f423 -I$(BUILD)/gen -I$(RTOS)/include -I$(RTOS)/portable/GCC/ARM_CM4F
+ CFLAGS := $(CPU) -Os -g3 -std=gnu11 -ffunction-sections -fdata-sections -fno-common -flto=auto -fcallgraph-info=su -MMD -MP \
+@@ -98,6 +103,13 @@ test-msg:
+ 	cc -std=c11 -Wall -Wextra -Werror -Icore \
+ 		core/messenger/msg_store.c core/messenger/msg_packet.c core/messenger/tests/msg_store_test.c -o $(BUILD)/msg-store-test
+ 	$(BUILD)/msg-store-test
++	cc -std=c11 -Wall -Wextra -Werror -Icore \
++		core/messenger/msg_kiss.c core/messenger/msg_link.c core/messenger/msg_bridge.c core/messenger/msg_packet.c \
++		core/messenger/tests/msg_link_test.c -o $(BUILD)/msg-link-test
++	$(BUILD)/msg-link-test
++	cc -std=c11 -Wall -Wextra -Werror -Icore \
++		core/messenger/msg_mesh.c core/messenger/msg_packet.c core/messenger/tests/msg_mesh_test.c -o $(BUILD)/msg-mesh-test
++	$(BUILD)/msg-mesh-test
+ stack-check: $(TARGET).elf
+ 	python3 tools/stack_check.py --build $(BUILD) --label rt880-lab --cc '$(CC)' \
+ 		--cflags '$(CFLAGS)' --elf $(TARGET).elf --overhead 208
+diff --git a/boards/rt880/link_uart.c b/boards/rt880/link_uart.c
+new file mode 100644
+index 0000000..d386057
+--- /dev/null
++++ b/boards/rt880/link_uart.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// Messenger link UART (link_uart.h). NOT WRITTEN YET: the programming-cable pins and the USART instance they mux to
++// still have to be traced on the board (continuity from the K-plug contacts to the AT32F423, then the datasheet's
++// alternate-function table). Until then these are inert: the link never attaches and the radio stays a standalone
++// messenger. What the real driver needs:
++//   - 38400 8N1 on that USART, clocked from its APB bus
++//   - an RX-not-empty interrupt filling a ring of >= 256 bytes: the link is serviced every 25 ms from the radio poll,
++//     and 25 ms at 38400 baud is 96 bytes
++//   - TX may be polled (the largest link frame is under 200 bytes, ~50 ms)
++#include "config.h"
++#if CONFIG_MESSENGER && CONFIG_MESSENGER_LINK
++#include "link_uart.h"
++
++void rt880_link_uart_init(void)
++{
++}
++
++size_t rt880_link_uart_read(uint8_t *buf, size_t max)
++{
++	(void)buf;
++	(void)max;
++	return 0;
++}
++
++void rt880_link_uart_write(const uint8_t *buf, size_t len)
++{
++	(void)buf;
++	(void)len;
++}
++#endif
+diff --git a/boards/rt880/link_uart.h b/boards/rt880/link_uart.h
+new file mode 100644
+index 0000000..323336c
+--- /dev/null
++++ b/boards/rt880/link_uart.h
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// The UART the messenger link (core/messenger/msg_bridge.h) runs on: the MCU's programming-cable UART, where an
++// ESP32 inside the radio is wired. Only built with CONFIG_MESSENGER_LINK.
++#ifndef RT880_LINK_UART_H
++#define RT880_LINK_UART_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++void rt880_link_uart_init(void);				// 38400 8N1, RX interrupt into a ring buffer
++size_t rt880_link_uart_read(uint8_t *buf, size_t max);		// bytes received since the last call, non-blocking
++void rt880_link_uart_write(const uint8_t *buf, size_t len);	// queue and send (may block briefly)
++
++#endif
+diff --git a/boards/rt880/radio.c b/boards/rt880/radio.c
+index abd1bf3..5591108 100644
+--- a/boards/rt880/radio.c
++++ b/boards/rt880/radio.c
+@@ -16,6 +16,11 @@
+ #include "messenger/msg_store.h"
+ #include "messenger/msg_radio.h"
+ #endif
++#if CONFIG_MESSENGER && CONFIG_MESSENGER_LINK
++#include "messenger/msg_bridge.h"
++#include "messenger/msg_link.h"
++#include "link_uart.h"
++#endif
+ 
+ static bk4819_t receiver, control;
+ static uint16_t receiver_id, control_id;
+@@ -361,6 +366,62 @@ static volatile bool msg_ack_pending;
+ static char msg_ack_to[MSG_CALLSIGN_LEN + 1];
+ static uint16_t msg_ack_id;
+ 
++#if CONFIG_MESSENGER_LINK
++// Messenger link (docs/bridge-protocol.md): a host on the UART (an ESP32 inside the radio) drives the GGM2 modem. Its
++// transmit requests wait here for the radio task, like the UI's. The link runs on the radio task too (from
++// rt880_msg_service), so the bridge needs no lock.
++static volatile bool br_tx_pending;
++static uint8_t br_tx_pkt[MSG_PKT_WIRE_LEN];
++static bool br_started;
++
++static bool br_tx(void *ctx, const uint8_t packet[MSG_PKT_WIRE_LEN])
++{
++	(void)ctx;
++	if (!ready || br_tx_pending) {
++		return false;
++	}
++	for (unsigned i = 0; i < MSG_PKT_WIRE_LEN; i++) {
++		br_tx_pkt[i] = packet[i];
++	}
++	br_tx_pending = true;
++	return true;
++}
++
++static void br_set_call(void *ctx, const char *call)
++{
++	(void)ctx;
++	rt880_msg_set_call(call);
++}
++
++static uint8_t br_caps(void *ctx)
++{
++	(void)ctx;
++	return MSG_LINK_CAP_TX;		// no listen-before-talk yet
++}
++
++static void link_service(void)
++{
++	uint32_t now = hal_millis();
++	if (!br_started) {
++		static const msg_bridge_ops_t ops = { .tx_packet = br_tx, .set_call = br_set_call, .caps = br_caps };
++		rt880_link_uart_init();
++		msg_bridge_init(&ops, msg_call);
++		br_started = true;
++	}
++	uint8_t in[64];
++	size_t n;
++	while ((n = rt880_link_uart_read(in, sizeof in)) > 0) {
++		msg_bridge_feed(in, n, now);
++	}
++	msg_bridge_tick(now);
++	uint8_t out[2u * MSG_LINK_FRAME_MAX];
++	n = msg_bridge_output(out, sizeof out);
++	if (n > 0) {
++		rt880_link_uart_write(out, n);
++	}
++}
++#endif
++
+ // Key one GGM2 frame already packed into w[], returning to RX afterwards. Returns whether the burst completed.
+ static bool msg_tx_frame(const uint16_t *w)
+ {
+@@ -418,6 +479,17 @@ void rt880_msg_service(void)
+ 	if (!ready) {
+ 		return;
+ 	}
++#if CONFIG_MESSENGER_LINK
++	link_service();
++	if (br_tx_pending) {
++		uint16_t w[MSG_FSK_WORDS];
++		msg_fsk_pack(w, br_tx_pkt);
++		bool ok = msg_tx_frame(w);
++		br_tx_pending = false;
++		msg_bridge_on_tx_done(br_tx_pkt, ok ? MSG_LINK_TX_OK : MSG_LINK_TX_REFUSED);
++		return;
++	}
++#endif
+ 	if (msg_tx_pending) {
+ 		msg_tx_run();
+ 		return;
+@@ -435,18 +507,29 @@ void rt880_msg_service(void)
+ 	uint8_t pkt[MSG_PKT_WIRE_LEN];
+ 	if (msg_fsk_unpack(pkt, msg_rx_words) && msg_packet_parse(pkt, sizeof pkt, &msg_rx)) {
+ 		msg_rx_valid = true;
++		bool store = true, auto_ack = true;
++#if CONFIG_MESSENGER_LINK
++		// Every valid frame goes to the host; while it owns the protocol the radio sends no ACK of its own.
++		msg_bridge_on_rx(pkt, (int8_t)(last_rssi < -128 ? -128 : last_rssi));
++		store = msg_bridge_local_store();
++		auto_ack = !msg_bridge_suppress_auto_ack();
++#endif
+ 		if (msg_rx.type == MSG_PKT_TYPE_TEXT) {
+ 			// A text message: file it in the inbox (which also refreshes HEARD), flag the UI to pop it up, and
+ 			// queue an ACK back to the sender so they see it was delivered.
+-			msg_store_add_inbox(msg_rx.from, (const char *)msg_rx.payload, msg_rx.type, last_rssi);
+-			msg_rx_new = true;
+-			unsigned i = 0;
+-			for (; msg_rx.from[i] && i < MSG_CALLSIGN_LEN; i++) {
+-				msg_ack_to[i] = msg_rx.from[i];
++			if (store) {
++				msg_store_add_inbox(msg_rx.from, (const char *)msg_rx.payload, msg_rx.type, last_rssi);
++				msg_rx_new = true;
++			}
++			if (auto_ack) {
++				unsigned i = 0;
++				for (; msg_rx.from[i] && i < MSG_CALLSIGN_LEN; i++) {
++					msg_ack_to[i] = msg_rx.from[i];
++				}
++				msg_ack_to[i] = '\0';
++				msg_ack_id = msg_rx.id;
++				msg_ack_pending = true;
+ 			}
+-			msg_ack_to[i] = '\0';
+-			msg_ack_id = msg_rx.id;
+-			msg_ack_pending = true;
+ 		} else if (msg_rx.type == MSG_PKT_TYPE_ACK) {
+ 			// An ACK for one of our messages: mark it delivered. Still refresh HEARD for the station.
+ 			msg_store_ack(msg_rx.id);
+diff --git a/core/messenger/msg_bridge.c b/core/messenger/msg_bridge.c
+new file mode 100644
+index 0000000..7a41cda
+--- /dev/null
++++ b/core/messenger/msg_bridge.c
+@@ -0,0 +1,262 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// The radio's side of the messenger link (msg_bridge.h).
++#include <string.h>
++#include "messenger/msg_bridge.h"
++#include "messenger/msg_link.h"
++#include "messenger/msg_kiss.h"
++
++static msg_bridge_ops_t ops;
++static msg_kiss_rx_t rx;
++static char own_call[MSG_CALLSIGN_LEN + 1];
++static bool attached;
++static uint8_t mode = MSG_LINK_MODE_DEFAULT;
++static uint32_t last_host_ms;
++static uint16_t dropped;
++
++// Output queue: a byte ring of whole encoded frames plus an index of their lengths. A producer appends a frame only
++// when all of it fits; output() hands out only whole frames that fit its buffer, so frames from the link task and the
++// radio task never interleave on the wire.
++#define OUT_FRAMES_MAX	16u
++static uint8_t out_ring[MSG_BRIDGE_OUT_BYTES];
++static uint16_t out_head, out_tail, out_used;		// bytes
++static uint16_t frame_len[OUT_FRAMES_MAX];		// lengths of the queued frames, oldest first
++static uint8_t frame_head, frame_count;
++
++static void lock(void)
++{
++	if (ops.lock != NULL) {
++		ops.lock(ops.ctx);
++	}
++}
++
++static void unlock(void)
++{
++	if (ops.unlock != NULL) {
++		ops.unlock(ops.ctx);
++	}
++}
++
++// Append one encoded frame. Caller holds the lock. False (and counted) when it doesn't fit.
++static bool out_push(const uint8_t *bytes, size_t n)
++{
++	if (n == 0 || n > MSG_BRIDGE_OUT_BYTES - out_used || frame_count >= OUT_FRAMES_MAX) {
++		dropped++;
++		return false;
++	}
++	for (size_t i = 0; i < n; i++) {
++		out_ring[out_tail] = bytes[i];
++		out_tail = (uint16_t)((out_tail + 1u) % MSG_BRIDGE_OUT_BYTES);
++	}
++	out_used = (uint16_t)(out_used + n);
++	frame_len[(frame_head + frame_count) % OUT_FRAMES_MAX] = (uint16_t)n;
++	frame_count++;
++	return true;
++}
++
++static void send_ctrl(uint8_t op, const uint8_t *data, size_t len)
++{
++	uint8_t enc[MSG_LINK_FRAME_MAX];
++	size_t n = msg_kiss_encode(enc, sizeof enc, MSG_LINK_CMD_CTRL, &op, 1, data, len);
++	lock();
++	(void)out_push(enc, n);
++	unlock();
++}
++
++static void send_error(uint8_t op, uint8_t err)
++{
++	uint8_t d[2] = { op, err };
++	send_ctrl(MSG_LINK_EV_ERROR, d, sizeof d);
++}
++
++static void send_hello_reply(void)
++{
++	uint8_t d[3 + MSG_CALLSIGN_LEN];
++	memset(d, 0, sizeof d);
++	d[0] = MSG_LINK_VERSION;
++	d[1] = mode;
++	d[2] = (ops.caps != NULL) ? ops.caps(ops.ctx) : MSG_LINK_CAP_TX;
++	memcpy(&d[3], own_call, strlen(own_call));
++	send_ctrl(MSG_LINK_EV_HELLO, d, sizeof d);
++}
++
++void msg_bridge_init(const msg_bridge_ops_t *o, const char *call)
++{
++	memset(&ops, 0, sizeof ops);
++	if (o != NULL) {
++		ops = *o;
++	}
++	msg_kiss_rx_init(&rx);
++	memset(own_call, 0, sizeof own_call);
++	for (unsigned i = 0; call != NULL && call[i] != '\0' && i < MSG_CALLSIGN_LEN; i++) {
++		own_call[i] = call[i];
++	}
++	attached = false;
++	mode = MSG_LINK_MODE_DEFAULT;
++	last_host_ms = 0;
++	dropped = 0;
++	out_head = out_tail = out_used = 0;
++	frame_head = frame_count = 0;
++}
++
++bool msg_bridge_claims(uint8_t b)
++{
++	return b == MSG_KISS_FEND;
++}
++
++static void on_data(const uint8_t *d, uint16_t n)
++{
++	msg_packet_t p;
++	if (n != MSG_PKT_WIRE_LEN || !msg_packet_parse(d, (uint8_t)n, &p)) {
++		send_error(MSG_LINK_CMD_DATA, MSG_LINK_ERR_BAD_PACKET);
++		return;
++	}
++	if (ops.tx_packet == NULL || !ops.tx_packet(ops.ctx, d)) {
++		uint8_t r[4] = { p.type, (uint8_t)(p.id & 0xFFu), (uint8_t)(p.id >> 8), MSG_LINK_TX_QUEUE_FULL };
++		send_ctrl(MSG_LINK_EV_TX_RESULT, r, sizeof r);
++	}
++}
++
++static void on_ctrl(const uint8_t *d, uint16_t n)
++{
++	if (n < 1u) {
++		return;
++	}
++	uint8_t op = d[0];
++	const uint8_t *a = &d[1];
++	uint16_t an = (uint16_t)(n - 1u);
++	switch (op) {
++	case MSG_LINK_OP_HELLO:
++		mode = MSG_LINK_MODE_DEFAULT;
++		attached = true;
++		send_hello_reply();
++		break;
++	case MSG_LINK_OP_SET_CALL:
++		if (an < 1u || an > MSG_CALLSIGN_LEN) {
++			send_error(op, MSG_LINK_ERR_BAD_LEN);
++			break;
++		}
++		memset(own_call, 0, sizeof own_call);
++		memcpy(own_call, a, an);
++		if (ops.set_call != NULL) {
++			ops.set_call(ops.ctx, own_call);
++		}
++		break;
++	case MSG_LINK_OP_KEEPALIVE:
++		break;
++	case MSG_LINK_OP_SET_MODE:
++		if (an != 1u) {
++			send_error(op, MSG_LINK_ERR_BAD_LEN);
++			break;
++		}
++		mode = a[0];
++		send_hello_reply();
++		break;
++	default:
++		send_error(op, MSG_LINK_ERR_BAD_OP);
++		break;
++	}
++}
++
++static void on_frame(const uint8_t *f, uint16_t len, uint32_t now_ms)
++{
++	if ((f[0] >> 4) != MSG_LINK_PORT) {
++		return;				// another KISS port: not ours
++	}
++	last_host_ms = now_ms;
++	if (f[0] == MSG_LINK_CMD_DATA) {
++		if (!attached) {
++			attached = true;	// a host that transmits without HELLO still gets bridge semantics
++		}
++		on_data(&f[1], (uint16_t)(len - 1u));
++	} else if (f[0] == MSG_LINK_CMD_CTRL) {
++		on_ctrl(&f[1], (uint16_t)(len - 1u));
++	}
++}
++
++void msg_bridge_feed(const uint8_t *buf, size_t len, uint32_t now_ms)
++{
++	for (size_t i = 0; i < len; i++) {
++		uint16_t n = msg_kiss_rx_byte(&rx, buf[i]);
++		if (n > 0) {
++			on_frame(rx.buf, n, now_ms);
++		}
++	}
++}
++
++bool msg_bridge_in_frame(void)
++{
++	return rx.in_frame && rx.len > 0;
++}
++
++size_t msg_bridge_output(uint8_t *buf, size_t max)
++{
++	size_t n = 0;
++	lock();
++	while (frame_count > 0 && n + frame_len[frame_head] <= max) {
++		uint16_t fl = frame_len[frame_head];
++		for (uint16_t i = 0; i < fl; i++) {
++			buf[n++] = out_ring[out_head];
++			out_head = (uint16_t)((out_head + 1u) % MSG_BRIDGE_OUT_BYTES);
++		}
++		out_used = (uint16_t)(out_used - fl);
++		frame_head = (uint8_t)((frame_head + 1u) % OUT_FRAMES_MAX);
++		frame_count--;
++	}
++	unlock();
++	return n;
++}
++
++void msg_bridge_tick(uint32_t now_ms)
++{
++	if (attached && (uint32_t)(now_ms - last_host_ms) > MSG_LINK_TIMEOUT_MS) {
++		attached = false;		// the host went away: the radio is a standalone messenger again
++		mode = MSG_LINK_MODE_DEFAULT;
++		lock();
++		out_head = out_tail = out_used = 0;
++		frame_head = frame_count = 0;
++		unlock();
++	}
++}
++
++bool msg_bridge_attached(void)
++{
++	return attached;
++}
++
++bool msg_bridge_suppress_auto_ack(void)
++{
++	return attached && (mode & MSG_LINK_MODE_BRIDGE) != 0;
++}
++
++bool msg_bridge_local_store(void)
++{
++	return !attached || (mode & MSG_LINK_MODE_STORE) != 0;
++}
++
++void msg_bridge_on_rx(const uint8_t packet[MSG_PKT_WIRE_LEN], int8_t rssi)
++{
++	if (!attached) {
++		return;
++	}
++	uint8_t head[2] = { MSG_LINK_EV_RX, (uint8_t)rssi };
++	uint8_t enc[MSG_LINK_FRAME_MAX];
++	size_t n = msg_kiss_encode(enc, sizeof enc, MSG_LINK_CMD_CTRL, head, sizeof head, packet, MSG_PKT_WIRE_LEN);
++	lock();
++	(void)out_push(enc, n);
++	unlock();
++}
++
++void msg_bridge_on_tx_done(const uint8_t packet[MSG_PKT_WIRE_LEN], uint8_t result)
++{
++	if (!attached) {
++		return;
++	}
++	uint8_t r[4] = { packet[5], packet[7], packet[8], result };	// type, id LE (wire offsets, msg_packet.h)
++	send_ctrl(MSG_LINK_EV_TX_RESULT, r, sizeof r);
++}
++
++uint16_t msg_bridge_dropped(void)
++{
++	return dropped;
++}
+diff --git a/core/messenger/msg_bridge.h b/core/messenger/msg_bridge.h
+new file mode 100644
+index 0000000..7b6a9dd
+--- /dev/null
++++ b/core/messenger/msg_bridge.h
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// The radio's side of the messenger link (msg_link.h, docs/bridge-protocol.md): it parses the host's KISS frames,
++// hands packets to transmit to the board, and queues received frames and transmit results for the host.
++//
++// No board or RTOS header: the board passes its hooks in msg_bridge_ops_t. The byte side (feed/output/in_frame) has
++// the shape of the host link's TNC slot (core/hostlink: claims/feed/in_frame/output), so a board with a host link
++// registers it there; a board without one polls its UART and calls feed/output itself.
++//
++// Tasks: feed/output/tick run on the link side (one task); on_rx/on_tx_done may run on the radio task. The output
++// queue is the only shared state; it is guarded by ops.lock/unlock when the two sides are different tasks.
++#ifndef MSG_BRIDGE_H
++#define MSG_BRIDGE_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include "messenger/msg_packet.h"
++
++#define MSG_BRIDGE_OUT_BYTES	640u	// output queue: about three RX events plus replies
++
++typedef struct {
++	// Queue one validated GGM2 packet for transmit on the radio's current channel. Called from feed(). Return false
++	// when a transmit is already pending (the host gets QUEUE_FULL). The board reports the outcome later through
++	// msg_bridge_on_tx_done().
++	bool (*tx_packet)(void *ctx, const uint8_t packet[MSG_PKT_WIRE_LEN]);
++	// The host set the radio's callsign (NUL-terminated, 1..8 chars). May be NULL.
++	void (*set_call)(void *ctx, const char *call);
++	// Capability bits for the HELLO reply (MSG_LINK_CAP_*). May be NULL (then TX only).
++	uint8_t (*caps)(void *ctx);
++	// Guard the output queue (NULL when feed/output and on_rx share one task).
++	void (*lock)(void *ctx);
++	void (*unlock)(void *ctx);
++	void *ctx;
++} msg_bridge_ops_t;
++
++// Start (or restart) with the board's hooks and its current callsign. The bridge starts detached.
++void msg_bridge_init(const msg_bridge_ops_t *ops, const char *call);
++
++// Byte side (link task)
++bool msg_bridge_claims(uint8_t b);				// true for FEND: a link frame starts
++void msg_bridge_feed(const uint8_t *buf, size_t len, uint32_t now_ms);
++bool msg_bridge_in_frame(void);
++size_t msg_bridge_output(uint8_t *buf, size_t max);	// whole frames only; 0 when there is nothing to send
++void msg_bridge_tick(uint32_t now_ms);			// leaves bridge mode after MSG_LINK_TIMEOUT_MS of silence
++
++// State, for the board's messenger code (radio task)
++bool msg_bridge_attached(void);		// a host said HELLO and is still talking
++bool msg_bridge_suppress_auto_ack(void);	// attached and in BRIDGE mode: don't send the radio's own ACKs
++bool msg_bridge_local_store(void);	// detached, or STORE mode: file received TEXT in the radio's inbox
++
++// Events from the radio (radio task). Dropped while detached, or when the output queue is full (counted).
++void msg_bridge_on_rx(const uint8_t packet[MSG_PKT_WIRE_LEN], int8_t rssi);
++void msg_bridge_on_tx_done(const uint8_t packet[MSG_PKT_WIRE_LEN], uint8_t result);
++uint16_t msg_bridge_dropped(void);
++
++#endif
+diff --git a/core/messenger/msg_kiss.c b/core/messenger/msg_kiss.c
+new file mode 100644
+index 0000000..20b63ba
+--- /dev/null
++++ b/core/messenger/msg_kiss.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// KISS framing (msg_kiss.h).
++#include "messenger/msg_kiss.h"
++
++void msg_kiss_rx_init(msg_kiss_rx_t *rx)
++{
++	rx->len = 0;
++	rx->in_frame = false;
++	rx->esc = false;
++	rx->overflow = false;
++}
++
++static void put(msg_kiss_rx_t *rx, uint8_t b)
++{
++	if (rx->len < MSG_KISS_MAX_FRAME) {
++		rx->buf[rx->len++] = b;
++	} else {
++		rx->overflow = true;
++	}
++}
++
++uint16_t msg_kiss_rx_byte(msg_kiss_rx_t *rx, uint8_t b)
++{
++	if (b == MSG_KISS_FEND) {
++		uint16_t done = (rx->in_frame && !rx->overflow) ? rx->len : 0;
++		// A FEND both closes the frame in progress and opens the next one (back-to-back frames share it).
++		rx->in_frame = true;
++		rx->esc = false;
++		rx->overflow = false;
++		rx->len = 0;
++		return done;
++	}
++	if (!rx->in_frame) {
++		return 0;			// noise before the first FEND
++	}
++	if (rx->esc) {
++		rx->esc = false;
++		if (b == MSG_KISS_TFEND) {
++			put(rx, MSG_KISS_FEND);
++		} else if (b == MSG_KISS_TFESC) {
++			put(rx, MSG_KISS_FESC);
++		} else {
++			rx->overflow = true;	// a protocol error: drop the frame at its closing FEND
++		}
++		return 0;
++	}
++	if (b == MSG_KISS_FESC) {
++		rx->esc = true;
++		return 0;
++	}
++	put(rx, b);
++	return 0;
++}
++
++static bool emit(uint8_t *out, size_t out_max, size_t *n, uint8_t b)
++{
++	if (b == MSG_KISS_FEND || b == MSG_KISS_FESC) {
++		if (*n + 2u > out_max) {
++			return false;
++		}
++		out[(*n)++] = MSG_KISS_FESC;
++		out[(*n)++] = (b == MSG_KISS_FEND) ? MSG_KISS_TFEND : MSG_KISS_TFESC;
++		return true;
++	}
++	if (*n + 1u > out_max) {
++		return false;
++	}
++	out[(*n)++] = b;
++	return true;
++}
++
++size_t msg_kiss_encode(uint8_t *out, size_t out_max, uint8_t cmd, const uint8_t *head, size_t hlen,
++	const uint8_t *data, size_t dlen)
++{
++	size_t n = 0;
++	if (out == NULL || out_max < 3u) {
++		return 0;
++	}
++	out[n++] = MSG_KISS_FEND;
++	if (!emit(out, out_max, &n, cmd)) {
++		return 0;
++	}
++	for (size_t i = 0; i < hlen; i++) {
++		if (!emit(out, out_max, &n, head[i])) {
++			return 0;
++		}
++	}
++	for (size_t i = 0; i < dlen; i++) {
++		if (!emit(out, out_max, &n, data[i])) {
++			return 0;
++		}
++	}
++	if (n + 1u > out_max) {
++		return 0;
++	}
++	out[n++] = MSG_KISS_FEND;
++	return n;
++}
+diff --git a/core/messenger/msg_kiss.h b/core/messenger/msg_kiss.h
+new file mode 100644
+index 0000000..72af702
+--- /dev/null
++++ b/core/messenger/msg_kiss.h
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// KISS framing (the public TNC host protocol): FEND 0xC0 delimits frames, FESC 0xDB escapes FEND/FESC inside them.
++// The first byte of a frame is the command: high nibble = port, low nibble = command (0 = data, 6 = SetHardware).
++// Used as the byte framing of the messenger link (msg_link.h) between a radio and its host (an ESP32, a PC).
++#ifndef MSG_KISS_H
++#define MSG_KISS_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++#define MSG_KISS_FEND		0xC0u
++#define MSG_KISS_FESC		0xDBu
++#define MSG_KISS_TFEND		0xDCu
++#define MSG_KISS_TFESC		0xDDu
++#define MSG_KISS_MAX_FRAME	128u	// command byte + data, unescaped; the link's largest frame is 98 bytes
++
++typedef struct {
++	uint8_t  buf[MSG_KISS_MAX_FRAME];	// command byte + data of the frame in progress / just completed
++	uint16_t len;
++	bool     in_frame;			// a FEND opened a frame and bytes are being collected
++	bool     esc;			// the previous byte was FESC
++	bool     overflow;			// the frame outgrew buf: it is dropped at its closing FEND
++} msg_kiss_rx_t;
++
++void msg_kiss_rx_init(msg_kiss_rx_t *rx);
++
++// Feed one received byte. Returns the length of a frame that just completed (buf[0] = command, then the data), or 0.
++// Empty frames (FEND FEND) and overflowed frames are dropped. The returned frame stays valid until the next byte.
++uint16_t msg_kiss_rx_byte(msg_kiss_rx_t *rx, uint8_t b);
++
++// Encode one frame: FEND, cmd, head[0..hlen), data[0..dlen) (both escaped), FEND. head or data may be NULL with length
++// 0. Returns the bytes written, or 0 when out_max is too small (nothing useful is written then).
++size_t msg_kiss_encode(uint8_t *out, size_t out_max, uint8_t cmd, const uint8_t *head, size_t hlen,
++	const uint8_t *data, size_t dlen);
++
++// Worst-case encoded size for a frame of n unescaped bytes after the command byte.
++#define MSG_KISS_ENCODED_MAX(n)	(2u * ((n) + 1u) + 2u)
++
++#endif
+diff --git a/core/messenger/msg_link.c b/core/messenger/msg_link.c
+new file mode 100644
+index 0000000..23f9b78
+--- /dev/null
++++ b/core/messenger/msg_link.c
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// The messenger link, host side (msg_link.h).
++#include <string.h>
++#include "messenger/msg_link.h"
++#include "messenger/msg_kiss.h"
++
++size_t msg_link_encode_tx(uint8_t *out, size_t out_max, const uint8_t packet[MSG_PKT_WIRE_LEN])
++{
++	return msg_kiss_encode(out, out_max, MSG_LINK_CMD_DATA, NULL, 0, packet, MSG_PKT_WIRE_LEN);
++}
++
++static size_t ctrl(uint8_t *out, size_t out_max, uint8_t op, const uint8_t *data, size_t len)
++{
++	return msg_kiss_encode(out, out_max, MSG_LINK_CMD_CTRL, &op, 1, data, len);
++}
++
++size_t msg_link_encode_hello(uint8_t *out, size_t out_max)
++{
++	uint8_t v = MSG_LINK_VERSION;
++	return ctrl(out, out_max, MSG_LINK_OP_HELLO, &v, 1);
++}
++
++size_t msg_link_encode_set_call(uint8_t *out, size_t out_max, const char *call)
++{
++	size_t n = 0;
++	while (call != NULL && call[n] != '\0' && n < MSG_CALLSIGN_LEN) {
++		n++;
++	}
++	if (n == 0) {
++		return 0;
++	}
++	return ctrl(out, out_max, MSG_LINK_OP_SET_CALL, (const uint8_t *)call, n);
++}
++
++size_t msg_link_encode_keepalive(uint8_t *out, size_t out_max)
++{
++	return ctrl(out, out_max, MSG_LINK_OP_KEEPALIVE, NULL, 0);
++}
++
++size_t msg_link_encode_set_mode(uint8_t *out, size_t out_max, uint8_t mode)
++{
++	return ctrl(out, out_max, MSG_LINK_OP_SET_MODE, &mode, 1);
++}
++
++bool msg_link_decode_event(const uint8_t *frame, uint16_t len, msg_link_event_t *ev)
++{
++	memset(ev, 0, sizeof *ev);
++	if (frame == NULL || len < 2u || frame[0] != MSG_LINK_CMD_CTRL) {
++		return false;
++	}
++	const uint8_t *d = &frame[2];
++	uint16_t n = (uint16_t)(len - 2u);
++	switch (frame[1]) {
++	case MSG_LINK_EV_RX:
++		if (n != 1u + MSG_PKT_WIRE_LEN) {
++			return false;
++		}
++		ev->kind = MSG_LINK_EVENT_RX;
++		ev->rssi = (int8_t)d[0];
++		memcpy(ev->packet, &d[1], MSG_PKT_WIRE_LEN);
++		return true;
++	case MSG_LINK_EV_HELLO:
++		if (n < 3u || n > 3u + MSG_CALLSIGN_LEN) {
++			return false;
++		}
++		ev->kind = MSG_LINK_EVENT_HELLO;
++		ev->version = d[0];
++		ev->mode = d[1];
++		ev->caps = d[2];
++		for (uint16_t i = 3; i < n && d[i] != 0; i++) {
++			ev->call[i - 3u] = (char)d[i];
++		}
++		return true;
++	case MSG_LINK_EV_TX_RESULT:
++		if (n != 4u) {
++			return false;
++		}
++		ev->kind = MSG_LINK_EVENT_TX_RESULT;
++		ev->tx_type = d[0];
++		ev->tx_id = (uint16_t)(d[1] | ((uint16_t)d[2] << 8));
++		ev->result = d[3];
++		return true;
++	case MSG_LINK_EV_ERROR:
++		if (n != 2u) {
++			return false;
++		}
++		ev->kind = MSG_LINK_EVENT_ERROR;
++		ev->op = d[0];
++		ev->error = d[1];
++		return true;
++	default:
++		return false;
++	}
++}
+diff --git a/core/messenger/msg_link.h b/core/messenger/msg_link.h
+new file mode 100644
+index 0000000..bca7de5
+--- /dev/null
++++ b/core/messenger/msg_link.h
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// The messenger link: a radio's GGM2 modem offered to a host (an ESP32 inside the radio or on the programming cable,
++// or a PC) over a UART, in KISS frames on KISS port 1. The radio only moves GGM2 packets on and off the air; the host
++// owns the messaging protocol (relay, dedup, ACKs, retries, storage). Spec: docs/bridge-protocol.md.
++//
++//   host -> radio                                   radio -> host
++//   0x10 <94-byte GGM2 packet>      transmit it     0x16 0x80 <rssi i8> <94-byte packet>   a frame was received
++//   0x16 0x01 <version>             HELLO           0x16 0x81 <version> <mode> <caps> <call 8>   HELLO reply
++//   0x16 0x02 <call, 1..8 bytes>    set callsign    0x16 0x82 <type> <id LE16> <result>   transmit result
++//   0x16 0x03                       keepalive       0x16 0x8F <op> <error>                 request refused
++//   0x16 0x04 <mode>                set mode
++//
++// This file holds the constants both ends share and the host's side (encode requests, decode the radio's events).
++// The radio's side is msg_bridge.h.
++#ifndef MSG_LINK_H
++#define MSG_LINK_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include "messenger/msg_packet.h"
++
++#define MSG_LINK_VERSION	1u
++#define MSG_LINK_PORT		1u			// KISS port; port 0 stays free for an APRS TNC
++#define MSG_LINK_CMD_DATA	((MSG_LINK_PORT << 4) | 0x0u)	// 0x10
++#define MSG_LINK_CMD_CTRL	((MSG_LINK_PORT << 4) | 0x6u)	// 0x16 (KISS SetHardware)
++
++// host -> radio control ops
++#define MSG_LINK_OP_HELLO	0x01u	// [version]: attach; the radio answers with HELLO_REPLY and enters bridge mode
++#define MSG_LINK_OP_SET_CALL	0x02u	// [call 1..8]: the radio's own callsign (its UI and any frame it builds itself)
++#define MSG_LINK_OP_KEEPALIVE	0x03u	// []: no reply; any frame from the host counts as a keepalive
++#define MSG_LINK_OP_SET_MODE	0x04u	// [mode]: MSG_LINK_MODE_* bits; answered with HELLO_REPLY
++
++// radio -> host events
++#define MSG_LINK_EV_RX		0x80u
++#define MSG_LINK_EV_HELLO	0x81u
++#define MSG_LINK_EV_TX_RESULT	0x82u
++#define MSG_LINK_EV_ERROR	0x8Fu
++
++// Mode bits (HELLO sets MSG_LINK_MODE_DEFAULT)
++#define MSG_LINK_MODE_BRIDGE	0x01u	// the radio does not answer TEXT with its own ACK: the host does
++#define MSG_LINK_MODE_STORE	0x02u	// the radio still files received TEXT in its own inbox (its screen shows them)
++#define MSG_LINK_MODE_DEFAULT	(MSG_LINK_MODE_BRIDGE | MSG_LINK_MODE_STORE)
++
++// Capability bits in the HELLO reply
++#define MSG_LINK_CAP_TX		0x01u	// the radio can transmit here (false on a receive-only build)
++#define MSG_LINK_CAP_LBT	0x02u	// the radio waits for a clear channel before it keys up
++
++// Transmit results
++#define MSG_LINK_TX_OK		0u
++#define MSG_LINK_TX_BUSY	1u	// the channel stayed busy (listen-before-talk gave up)
++#define MSG_LINK_TX_REFUSED	2u	// no TX here (out of a TX band, receive-only, TX inhibited)
++#define MSG_LINK_TX_QUEUE_FULL	3u	// a transmit is already pending: send again after its result
++#define MSG_LINK_TX_TIMEOUT	4u	// the burst never finished
++
++// Errors
++#define MSG_LINK_ERR_BAD_PACKET	1u	// the data frame is not a valid GGM2 packet (length, magic, version, CRC)
++#define MSG_LINK_ERR_BAD_OP	2u
++#define MSG_LINK_ERR_BAD_LEN	3u
++
++#define MSG_LINK_TIMEOUT_MS	15000u	// the radio leaves bridge mode after this long without a frame from the host
++#define MSG_LINK_KEEPALIVE_MS	5000u	// how often the host should send something
++
++// Largest encoded link frame (RX event: cmd, op, rssi, 94 bytes, all escaped, plus two FENDs)
++#define MSG_LINK_FRAME_MAX	(2u * (3u + MSG_PKT_WIRE_LEN) + 2u)
++
++// ---- host side ----------------------------------------------------------------------------------------------------
++// Each returns the encoded byte count written to out (out_max >= MSG_LINK_FRAME_MAX is always enough), 0 on error.
++size_t msg_link_encode_tx(uint8_t *out, size_t out_max, const uint8_t packet[MSG_PKT_WIRE_LEN]);
++size_t msg_link_encode_hello(uint8_t *out, size_t out_max);
++size_t msg_link_encode_set_call(uint8_t *out, size_t out_max, const char *call);
++size_t msg_link_encode_keepalive(uint8_t *out, size_t out_max);
++size_t msg_link_encode_set_mode(uint8_t *out, size_t out_max, uint8_t mode);
++
++typedef enum {
++	MSG_LINK_EVENT_NONE = 0,
++	MSG_LINK_EVENT_RX,		// rssi, packet
++	MSG_LINK_EVENT_HELLO,		// version, mode, caps, call
++	MSG_LINK_EVENT_TX_RESULT,	// tx_type, tx_id, result
++	MSG_LINK_EVENT_ERROR,		// op, error
++} msg_link_event_kind_t;
++
++typedef struct {
++	msg_link_event_kind_t kind;
++	int8_t   rssi;
++	uint8_t  packet[MSG_PKT_WIRE_LEN];
++	uint8_t  version, mode, caps;
++	char     call[MSG_CALLSIGN_LEN + 1];
++	uint8_t  tx_type;
++	uint16_t tx_id;
++	uint8_t  result;
++	uint8_t  op, error;
++} msg_link_event_t;
++
++// Decode one completed KISS frame (msg_kiss_rx_byte's buf/len) from the radio. Returns false (kind NONE) for frames
++// that are not the link's (another port, unknown op, wrong length).
++bool msg_link_decode_event(const uint8_t *frame, uint16_t len, msg_link_event_t *ev);
++
++#endif
+diff --git a/core/messenger/msg_mesh.c b/core/messenger/msg_mesh.c
+new file mode 100644
+index 0000000..0396a4c
+--- /dev/null
++++ b/core/messenger/msg_mesh.c
+@@ -0,0 +1,288 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// Store-and-forward mesh over GGM2 (msg_mesh.h).
++#include <string.h>
++#include "messenger/msg_mesh.h"
++
++void msg_mesh_default_cfg(msg_mesh_cfg_t *cfg, const char *call)
++{
++	memset(cfg, 0, sizeof *cfg);
++	for (unsigned i = 0; call != NULL && call[i] != '\0' && i < MSG_CALLSIGN_LEN; i++) {
++		cfg->call[i] = call[i];
++	}
++	cfg->ttl = 3;
++	cfg->relay = true;
++	cfg->ack_broadcast = true;
++	cfg->retries = 2;
++	cfg->relay_min_ms = 200;
++	cfg->relay_slot_ms = 1200;	// one GGM2 burst on air is ~0.9 s
++	cfg->relay_slots = 4;
++	// One GGM2 burst is about 0.9 s on air (16-byte preamble + 100 bytes at 1200 baud) plus keying; a hop costs a
++	// relay delay and a burst each way.
++	cfg->ack_base_ms = 3000;
++	cfg->ack_hop_ms = 4500;
++}
++
++void msg_mesh_init(msg_mesh_t *m, const msg_mesh_cfg_t *cfg, const msg_mesh_ops_t *ops)
++{
++	memset(m, 0, sizeof *m);
++	m->cfg = *cfg;
++	m->ops = *ops;
++	m->next_id = (uint16_t)(ops->rand(ops->ctx) | 1u);
++}
++
++void msg_mesh_set_call(msg_mesh_t *m, const char *call)
++{
++	memset(m->cfg.call, 0, sizeof m->cfg.call);
++	for (unsigned i = 0; call != NULL && call[i] != '\0' && i < MSG_CALLSIGN_LEN; i++) {
++		m->cfg.call[i] = call[i];
++	}
++}
++
++static bool same_call(const char *a, const char *b)
++{
++	return strncmp(a, b, MSG_CALLSIGN_LEN) == 0;
++}
++
++static bool is_all(const char *to)
++{
++	return to == NULL || to[0] == '\0' || same_call(to, MSG_PKT_TO_ALL);
++}
++
++static uint32_t rand_between(msg_mesh_t *m, uint32_t lo, uint32_t hi)
++{
++	if (hi <= lo) {
++		return lo;
++	}
++	return lo + m->ops.rand(m->ops.ctx) % (hi - lo + 1u);
++}
++
++static bool due(uint32_t now, uint32_t at)
++{
++	return (int32_t)(now - at) >= 0;
++}
++
++// ---- seen table ---------------------------------------------------------------------------------------------------
++static msg_mesh_seen_t *seen_find(msg_mesh_t *m, const char *from, uint16_t id, uint8_t type, uint32_t now)
++{
++	for (unsigned i = 0; i < MSG_MESH_SEEN_MAX; i++) {
++		msg_mesh_seen_t *s = &m->seen[i];
++		if (s->used && s->id == id && s->type == type &&
++		    memcmp(s->key_from, from, MSG_CALLSIGN_LEN) == 0) {
++			if ((uint32_t)(now - s->at) > MSG_MESH_SEEN_MS) {
++				s->used = false;	// expired: treat as new
++				return NULL;
++			}
++			return s;
++		}
++	}
++	return NULL;
++}
++
++static void seen_add(msg_mesh_t *m, const char *from, uint16_t id, uint8_t type, uint32_t now)
++{
++	msg_mesh_seen_t *s = &m->seen[m->seen_next];
++	m->seen_next = (uint8_t)((m->seen_next + 1u) % MSG_MESH_SEEN_MAX);
++	memset(s, 0, sizeof *s);
++	for (unsigned i = 0; i < MSG_CALLSIGN_LEN && from[i] != '\0'; i++) {
++		s->key_from[i] = (uint8_t)from[i];
++	}
++	s->id = id;
++	s->type = type;
++	s->at = now;
++	s->used = true;
++}
++
++// ---- relays -------------------------------------------------------------------------------------------------------
++static void relay_schedule(msg_mesh_t *m, const uint8_t packet[MSG_PKT_WIRE_LEN], uint8_t ttl_remain, uint32_t now)
++{
++	for (unsigned i = 0; i < MSG_MESH_RELAY_MAX; i++) {
++		msg_mesh_relay_t *r = &m->relay[i];
++		if (!r->used) {
++			r->used = true;
++			memcpy(r->packet, packet, MSG_PKT_WIRE_LEN);
++			msg_packet_set_ttl_remain(r->packet, (uint8_t)(ttl_remain - 1u));
++			uint32_t slots = m->cfg.relay_slots ? m->cfg.relay_slots : 1u;
++			uint32_t slot = m->ops.rand(m->ops.ctx) % slots;
++			r->due = now + m->cfg.relay_min_ms + slot * m->cfg.relay_slot_ms + rand_between(m, 0, 99);
++			return;
++		}
++	}
++	// Relay table full: this copy is dropped; a neighbor will usually carry it.
++}
++
++// Another node relayed the frame we were about to relay: ours adds nothing for the shared neighborhood.
++static void relay_cancel(msg_mesh_t *m, const msg_packet_t *p)
++{
++	for (unsigned i = 0; i < MSG_MESH_RELAY_MAX; i++) {
++		msg_mesh_relay_t *r = &m->relay[i];
++		if (!r->used) {
++			continue;
++		}
++		msg_packet_t q;
++		if (msg_packet_parse(r->packet, MSG_PKT_WIRE_LEN, &q) && q.id == p->id && q.type == p->type &&
++		    same_call(q.from, p->from)) {
++			r->used = false;
++			m->suppressed++;
++		}
++	}
++}
++
++// ---- own messages -------------------------------------------------------------------------------------------------
++static uint32_t ack_window(const msg_mesh_t *m, uint8_t ttl)
++{
++	return (uint32_t)m->cfg.ack_base_ms + (uint32_t)m->cfg.ack_hop_ms * ttl;
++}
++
++static void send_ack(msg_mesh_t *m, const msg_packet_t *p, uint8_t ttl)
++{
++	uint8_t pkt[MSG_PKT_WIRE_LEN];
++	if (msg_packet_build_ack_ttl(pkt, sizeof pkt, p->id, m->cfg.call, p->from, ttl) == MSG_PKT_WIRE_LEN) {
++		m->ops.send(m->ops.ctx, pkt);
++	}
++}
++
++bool msg_mesh_send_text(msg_mesh_t *m, const char *to, const char *text, uint32_t now_ms, uint16_t *id_out)
++{
++	if (text == NULL || text[0] == '\0') {
++		return false;
++	}
++	msg_mesh_pending_t *slot = NULL;
++	for (unsigned i = 0; i < MSG_MESH_PENDING_MAX; i++) {
++		if (!m->pending[i].used) {
++			slot = &m->pending[i];
++			break;
++		}
++	}
++	if (slot == NULL) {
++		return false;
++	}
++	uint16_t id = m->next_id++;
++	if (m->next_id == 0) {
++		m->next_id = 1;
++	}
++	uint8_t ttl = m->cfg.ttl ? m->cfg.ttl : 1u;
++	if (msg_packet_build_text_to(slot->packet, sizeof slot->packet, id, m->cfg.call, is_all(to) ? MSG_PKT_TO_ALL : to,
++		text, ttl) != MSG_PKT_WIRE_LEN) {
++		return false;
++	}
++	slot->used = true;
++	slot->to_all = is_all(to);
++	slot->id = id;
++	slot->tries = 1;
++	slot->deadline = now_ms + ack_window(m, ttl);
++	seen_add(m, m->cfg.call, id, MSG_PKT_TYPE_TEXT, now_ms);
++	m->ops.send(m->ops.ctx, slot->packet);
++	if (m->ops.status != NULL) {
++		m->ops.status(m->ops.ctx, id, MSG_MESH_ST_SENT);
++	}
++	if (id_out != NULL) {
++		*id_out = id;
++	}
++	return true;
++}
++
++static void pending_acked(msg_mesh_t *m, uint16_t id)
++{
++	for (unsigned i = 0; i < MSG_MESH_PENDING_MAX; i++) {
++		msg_mesh_pending_t *pd = &m->pending[i];
++		if (pd->used && pd->id == id) {
++			pd->used = false;
++			if (m->ops.status != NULL) {
++				m->ops.status(m->ops.ctx, id, MSG_MESH_ST_ACKED);
++			}
++			return;
++		}
++	}
++}
++
++// ---- receive ------------------------------------------------------------------------------------------------------
++void msg_mesh_on_rx(msg_mesh_t *m, const uint8_t packet[MSG_PKT_WIRE_LEN], int8_t rssi, uint32_t now_ms)
++{
++	msg_packet_t p;
++	if (!msg_packet_parse(packet, MSG_PKT_WIRE_LEN, &p)) {
++		return;
++	}
++	if (same_call(p.from, m->cfg.call)) {
++		relay_cancel(m, &p);		// our own frame echoed by a relay: nothing to do
++		return;
++	}
++	if (m->ops.heard != NULL) {
++		m->ops.heard(m->ops.ctx, &p, rssi);
++	}
++	uint8_t hops = (p.ttl_init >= p.ttl_remain) ? (uint8_t)(p.ttl_init - p.ttl_remain) : 0u;
++	bool to_me = same_call(p.to, m->cfg.call);
++	bool to_all = same_call(p.to, MSG_PKT_TO_ALL);
++
++	if (seen_find(m, p.from, p.id, p.type, now_ms) != NULL) {
++		m->duplicates++;
++		relay_cancel(m, &p);
++		if (p.type == MSG_PKT_TYPE_TEXT && to_me) {
++			send_ack(m, &p, (uint8_t)(hops + 1u));	// the sender is retrying: our ACK may have been lost
++		}
++		return;
++	}
++	seen_add(m, p.from, p.id, p.type, now_ms);
++
++	switch (p.type) {
++	case MSG_PKT_TYPE_TEXT:
++		if (to_me || to_all) {
++			m->ops.deliver(m->ops.ctx, &p, rssi, hops);
++		}
++		if (to_me) {
++			send_ack(m, &p, (uint8_t)(hops + 1u));
++		} else if (to_all && hops == 0 && m->cfg.ack_broadcast) {
++			send_ack(m, &p, 1);
++		}
++		if (!to_me && m->cfg.relay && p.ttl_remain > 1u) {
++			relay_schedule(m, packet, p.ttl_remain, now_ms);
++			m->relayed++;
++		}
++		break;
++	case MSG_PKT_TYPE_ACK:
++		if (to_me) {
++			pending_acked(m, p.id);
++		} else if (m->cfg.relay && p.ttl_remain > 1u) {
++			relay_schedule(m, packet, p.ttl_remain, now_ms);
++			m->relayed++;
++		}
++		break;
++	default:
++		break;				// PING/PONG/WAKE: neighbor-only
++	}
++}
++
++void msg_mesh_tick(msg_mesh_t *m, uint32_t now_ms)
++{
++	for (unsigned i = 0; i < MSG_MESH_RELAY_MAX; i++) {
++		msg_mesh_relay_t *r = &m->relay[i];
++		if (r->used && due(now_ms, r->due)) {
++			r->used = false;
++			m->ops.send(m->ops.ctx, r->packet);
++		}
++	}
++	for (unsigned i = 0; i < MSG_MESH_PENDING_MAX; i++) {
++		msg_mesh_pending_t *pd = &m->pending[i];
++		if (!pd->used || !due(now_ms, pd->deadline)) {
++			continue;
++		}
++		if (pd->to_all) {
++			pd->used = false;
++			if (m->ops.status != NULL) {
++				m->ops.status(m->ops.ctx, pd->id, MSG_MESH_ST_NO_ACK);
++			}
++		} else if (pd->tries <= m->cfg.retries) {
++			pd->tries++;
++			pd->deadline = now_ms + ack_window(m, pd->packet[9]) + rand_between(m, 200, 800);
++			m->ops.send(m->ops.ctx, pd->packet);	// same id: receivers dedup it and ACK again
++			if (m->ops.status != NULL) {
++				m->ops.status(m->ops.ctx, pd->id, MSG_MESH_ST_SENT);
++			}
++		} else {
++			pd->used = false;
++			if (m->ops.status != NULL) {
++				m->ops.status(m->ops.ctx, pd->id, MSG_MESH_ST_FAILED);
++			}
++		}
++	}
++}
+diff --git a/core/messenger/msg_mesh.h b/core/messenger/msg_mesh.h
+new file mode 100644
+index 0000000..9696222
+--- /dev/null
++++ b/core/messenger/msg_mesh.h
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// A small store-and-forward mesh on top of GGM2, run by the link host (the ESP32): the radio is only its modem.
++// Rules (docs/bridge-protocol.md, section "Mesh"):
++//   - Dedup on (from, id, type), remembered MSG_MESH_SEEN_MS.
++//   - TEXT and ACK are relayed while ttl_remain > 1, with ttl_remain - 1 and a random delay; a relay is cancelled if
++//     another node's copy of the same frame is heard first (one copy per neighborhood is enough). The delay is a
++//     random slot longer than a burst, so the earliest relay is heard before the others fire.
++//   - TEXT to us: delivered and ACKed with a hop budget of the hops it took + 1, so the ACK comes back over relays.
++//     A duplicate TEXT to us is ACKed again (our first ACK may have been lost) but not delivered again.
++//   - TEXT to ALL: delivered; ACKed (budget 1) only when heard first-hand, as a plain GOGUFW radio does.
++//   - Our own TEXT: retried until ACKed (direct) or one ACK window passes (to ALL).
++//   - PING/PONG/WAKE are neighbor-only: never relayed.
++// No globals: one msg_mesh_t per node, so host tests can run a whole network in one process.
++#ifndef MSG_MESH_H
++#define MSG_MESH_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include "messenger/msg_packet.h"
++
++#define MSG_MESH_SEEN_MAX	48u
++#define MSG_MESH_SEEN_MS	120000u	// how long a frame key is remembered (a 16-bit id wraps much later)
++#define MSG_MESH_RELAY_MAX	6u
++#define MSG_MESH_PENDING_MAX	4u	// own messages waiting for an ACK
++
++typedef enum {
++	MSG_MESH_ST_SENT = 0,	// on the air (each try)
++	MSG_MESH_ST_ACKED,	// delivered: an ACK came back
++	MSG_MESH_ST_NO_ACK,	// to ALL: the window passed with no ACK (it may still have been heard)
++	MSG_MESH_ST_FAILED,	// direct: every try went unanswered
++} msg_mesh_status_t;
++
++typedef struct {
++	// Put one packet on the air (through the link). The mesh never sends two at once on its own; the host's link
++	// queue serializes them.
++	void (*send)(void *ctx, const uint8_t packet[MSG_PKT_WIRE_LEN]);
++	// A TEXT for us or for ALL, first copy only.
++	void (*deliver)(void *ctx, const msg_packet_t *p, int8_t rssi, uint8_t hops);
++	// Progress of one of our own messages. May be NULL.
++	void (*status)(void *ctx, uint16_t id, msg_mesh_status_t st);
++	// Any valid frame heard first-hand or relayed (HEARD list, logging). May be NULL.
++	void (*heard)(void *ctx, const msg_packet_t *p, int8_t rssi);
++	uint32_t (*rand)(void *ctx);
++	void *ctx;
++} msg_mesh_ops_t;
++
++typedef struct {
++	char     call[MSG_CALLSIGN_LEN + 1];
++	uint8_t  ttl;			// hop budget of our own TEXT (1 = neighbors only); GOGUFW uses 3
++	bool     relay;			// forward other stations' TEXT/ACK
++	bool     ack_broadcast;		// ACK first-hand TEXT to ALL (GOGUFW behavior)
++	uint8_t  retries;		// extra tries for a direct TEXT
++	// Relay delay = relay_min_ms + a random slot of relay_slot_ms (0..relay_slots-1) + 0..99 ms jitter. A slot is
++	// longer than one burst, so a relay in an earlier slot is heard, and suppresses the others, before they fire.
++	uint16_t relay_min_ms, relay_slot_ms;
++	uint8_t  relay_slots;
++	uint16_t ack_base_ms;		// ACK window = ack_base_ms + ack_hop_ms * ttl
++	uint16_t ack_hop_ms;
++} msg_mesh_cfg_t;
++
++void msg_mesh_default_cfg(msg_mesh_cfg_t *cfg, const char *call);
++
++typedef struct {
++	uint8_t  key_from[MSG_CALLSIGN_LEN];
++	uint16_t id;
++	uint8_t  type;
++	uint32_t at;
++	bool     used;
++} msg_mesh_seen_t;
++
++typedef struct {
++	bool     used;
++	uint8_t  packet[MSG_PKT_WIRE_LEN];
++	uint32_t due;
++} msg_mesh_relay_t;
++
++typedef struct {
++	bool     used;
++	bool     to_all;
++	uint8_t  packet[MSG_PKT_WIRE_LEN];
++	uint16_t id;
++	uint8_t  tries;
++	uint32_t deadline;
++} msg_mesh_pending_t;
++
++typedef struct {
++	msg_mesh_cfg_t cfg;
++	msg_mesh_ops_t ops;
++	uint16_t next_id;
++	msg_mesh_seen_t seen[MSG_MESH_SEEN_MAX];
++	uint8_t  seen_next;
++	msg_mesh_relay_t relay[MSG_MESH_RELAY_MAX];
++	msg_mesh_pending_t pending[MSG_MESH_PENDING_MAX];
++	uint16_t relayed, suppressed, duplicates;	// counters for a status page
++} msg_mesh_t;
++
++void msg_mesh_init(msg_mesh_t *m, const msg_mesh_cfg_t *cfg, const msg_mesh_ops_t *ops);
++void msg_mesh_set_call(msg_mesh_t *m, const char *call);
++
++// Send a TEXT (to NULL/""/"ALL" = broadcast). Returns false when the pending table is full or text is empty.
++bool msg_mesh_send_text(msg_mesh_t *m, const char *to, const char *text, uint32_t now_ms, uint16_t *id_out);
++
++// A frame came in from the radio.
++void msg_mesh_on_rx(msg_mesh_t *m, const uint8_t packet[MSG_PKT_WIRE_LEN], int8_t rssi, uint32_t now_ms);
++
++// Run timers (relays due, ACK windows). Call every 10..100 ms.
++void msg_mesh_tick(msg_mesh_t *m, uint32_t now_ms);
++
++#endif
+diff --git a/core/messenger/msg_packet.c b/core/messenger/msg_packet.c
+index 763640f..933e305 100644
+--- a/core/messenger/msg_packet.c
++++ b/core/messenger/msg_packet.c
+@@ -66,11 +66,17 @@ static void finalize(uint8_t *out)
+ 
+ uint8_t msg_packet_build_text(uint8_t *out, uint8_t out_len, uint16_t id, const char *from, const char *text,
+ 	uint8_t ttl_init)
++{
++	return msg_packet_build_text_to(out, out_len, id, from, MSG_PKT_TO_ALL, text, ttl_init);
++}
++
++uint8_t msg_packet_build_text_to(uint8_t *out, uint8_t out_len, uint16_t id, const char *from, const char *to,
++	const char *text, uint8_t ttl_init)
+ {
+ 	if (out == NULL || out_len < MSG_PKT_WIRE_LEN) {
+ 		return 0;
+ 	}
+-	build_header(out, MSG_PKT_TYPE_TEXT, id, from, MSG_PKT_TO_ALL, ttl_init, ttl_init);
++	build_header(out, MSG_PKT_TYPE_TEXT, id, from, to, ttl_init, ttl_init);
+ 	uint8_t text_len = 0;
+ 	if (text != NULL) {
+ 		while (text[text_len] && text_len < MSG_PKT_MAX_PAYLOAD) {
+@@ -84,11 +90,23 @@ uint8_t msg_packet_build_text(uint8_t *out, uint8_t out_len, uint16_t id, const
+ }
+ 
+ uint8_t msg_packet_build_ack(uint8_t *out, uint8_t out_len, uint16_t id, const char *from, const char *to)
++{
++	return msg_packet_build_ack_ttl(out, out_len, id, from, to, 1);
++}
++
++void msg_packet_set_ttl_remain(uint8_t packet[MSG_PKT_WIRE_LEN], uint8_t ttl_remain)
++{
++	packet[10] = ttl_remain;
++	finalize(packet);
++}
++
++uint8_t msg_packet_build_ack_ttl(uint8_t *out, uint8_t out_len, uint16_t id, const char *from, const char *to,
++	uint8_t ttl)
+ {
+ 	if (out == NULL || out_len < MSG_PKT_WIRE_LEN) {
+ 		return 0;
+ 	}
+-	build_header(out, MSG_PKT_TYPE_ACK, id, from, to, 1, 1);
++	build_header(out, MSG_PKT_TYPE_ACK, id, from, to, ttl, ttl);
+ 	// Mirror the ACKed message id in the payload too, for a robust fallback match (GOGUFW RF21).
+ 	out[27] = 2;
+ 	out[28] = (uint8_t)(id & 0xFFu);
+diff --git a/core/messenger/msg_packet.h b/core/messenger/msg_packet.h
+index dbe32f6..afb3853 100644
+--- a/core/messenger/msg_packet.h
++++ b/core/messenger/msg_packet.h
+@@ -50,6 +50,15 @@ uint16_t msg_packet_crc16(const uint8_t *data, uint16_t len);
+ // Build a packet into out (>= MSG_PKT_WIRE_LEN). Returns the byte count written, or 0 on a bad buffer. from NULL/empty
+ // falls back to "UVK1"; a TEXT message always goes to ALL (broadcast RF).
+ uint8_t msg_packet_build_text(uint8_t *out, uint8_t out_len, uint16_t id, const char *from, const char *text, uint8_t ttl_init);
++// As build_text, to one station (to NULL/empty = ALL). A GOGUFW radio shows it like any TEXT; mesh hosts use `to`
++// to decide who ACKs it and whether to relay it on.
++uint8_t msg_packet_build_text_to(uint8_t *out, uint8_t out_len, uint16_t id, const char *from, const char *to,
++	const char *text, uint8_t ttl_init);
++// ACK with an explicit hop budget (ttl_init = ttl_remain = ttl), so a mesh ACK can travel back over relays.
++uint8_t msg_packet_build_ack_ttl(uint8_t *out, uint8_t out_len, uint16_t id, const char *from, const char *to,
++	uint8_t ttl);
++// Rewrite ttl_remain of a built packet in place and fix its CRC (a relay forwarding a frame one hop on).
++void msg_packet_set_ttl_remain(uint8_t packet[MSG_PKT_WIRE_LEN], uint8_t ttl_remain);
+ uint8_t msg_packet_build_ack(uint8_t *out, uint8_t out_len, uint16_t id, const char *from, const char *to);
+ uint8_t msg_packet_build_ping(uint8_t *out, uint8_t out_len, uint16_t id, const char *from);
+ uint8_t msg_packet_build_wake(uint8_t *out, uint8_t out_len, uint16_t id, const char *from);
+diff --git a/core/messenger/tests/msg_link_test.c b/core/messenger/tests/msg_link_test.c
+new file mode 100644
+index 0000000..1f73cc4
+--- /dev/null
++++ b/core/messenger/tests/msg_link_test.c
+@@ -0,0 +1,214 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// Host test: KISS framing, the host side of the messenger link and the radio-side bridge talking to each other.
++#include <stdio.h>
++#include <string.h>
++#include "messenger/msg_kiss.h"
++#include "messenger/msg_link.h"
++#include "messenger/msg_bridge.h"
++
++static int failures;
++#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
++
++// ---- a fake board --------------------------------------------------------------------------------------------------
++static uint8_t board_tx[MSG_PKT_WIRE_LEN];
++static int board_tx_count;
++static bool board_tx_busy;
++static char board_call[MSG_CALLSIGN_LEN + 1];
++
++static bool fake_tx(void *ctx, const uint8_t p[MSG_PKT_WIRE_LEN])
++{
++	(void)ctx;
++	if (board_tx_busy) {
++		return false;
++	}
++	memcpy(board_tx, p, MSG_PKT_WIRE_LEN);
++	board_tx_count++;
++	board_tx_busy = true;
++	return true;
++}
++
++static void fake_call(void *ctx, const char *c)
++{
++	(void)ctx;
++	strncpy(board_call, c, MSG_CALLSIGN_LEN);
++}
++
++static uint8_t fake_caps(void *ctx)
++{
++	(void)ctx;
++	return MSG_LINK_CAP_TX | MSG_LINK_CAP_LBT;
++}
++
++// Pull every frame the bridge has for the host and decode the events.
++static int host_read(msg_link_event_t *evs, int max)
++{
++	static msg_kiss_rx_t krx;
++	static bool init;
++	if (!init) {
++		msg_kiss_rx_init(&krx);
++		init = true;
++	}
++	uint8_t buf[256];
++	int n = 0;
++	size_t got;
++	while ((got = msg_bridge_output(buf, sizeof buf)) > 0) {
++		for (size_t i = 0; i < got; i++) {
++			uint16_t fl = msg_kiss_rx_byte(&krx, buf[i]);
++			if (fl > 0 && n < max && msg_link_decode_event(krx.buf, fl, &evs[n])) {
++				n++;
++			}
++		}
++	}
++	return n;
++}
++
++static void test_kiss(void)
++{
++	// Every byte value, including FEND/FESC, survives a round trip.
++	uint8_t data[256];
++	for (int i = 0; i < 100; i++) {
++		data[i] = (uint8_t)(i * 37u);
++	}
++	data[3] = MSG_KISS_FEND;
++	data[4] = MSG_KISS_FESC;
++	uint8_t enc[MSG_KISS_ENCODED_MAX(100)];
++	size_t n = msg_kiss_encode(enc, sizeof enc, 0x10, NULL, 0, data, 100);
++	CHECK(n > 102);
++	CHECK(enc[0] == MSG_KISS_FEND && enc[n - 1] == MSG_KISS_FEND);
++	for (size_t i = 1; i + 1 < n; i++) {
++		CHECK(enc[i] != MSG_KISS_FEND);
++	}
++	msg_kiss_rx_t rx;
++	msg_kiss_rx_init(&rx);
++	CHECK(msg_kiss_rx_byte(&rx, 0x55) == 0);	// noise before the first FEND is ignored
++	uint16_t got = 0;
++	for (size_t i = 0; i < n; i++) {
++		uint16_t r = msg_kiss_rx_byte(&rx, enc[i]);
++		if (r) {
++			got = r;
++		}
++	}
++	CHECK(got == 101);
++	CHECK(rx.buf[0] == 0x10 && memcmp(&rx.buf[1], data, 100) == 0);
++	// Too small an output buffer writes nothing useful.
++	CHECK(msg_kiss_encode(enc, 10, 0x10, NULL, 0, data, 100) == 0);
++	// A bad escape drops the frame.
++	msg_kiss_rx_init(&rx);
++	uint8_t bad[] = { MSG_KISS_FEND, 0x10, MSG_KISS_FESC, 0x01, 0x02, MSG_KISS_FEND };
++	got = 0;
++	for (size_t i = 0; i < sizeof bad; i++) {
++		got |= msg_kiss_rx_byte(&rx, bad[i]);
++	}
++	CHECK(got == 0);
++}
++
++static void test_bridge(void)
++{
++	msg_bridge_ops_t ops = { .tx_packet = fake_tx, .set_call = fake_call, .caps = fake_caps };
++	msg_bridge_init(&ops, "RT880");
++	msg_link_event_t ev[8];
++	uint8_t f[MSG_LINK_FRAME_MAX];
++	uint8_t pkt[MSG_PKT_WIRE_LEN];
++	msg_packet_build_text(pkt, sizeof pkt, 0x0102, "SV4QXF", "hi", 3);
++
++	// Detached: nothing is queued for a host that isn't there; the radio ACKs and stores by itself.
++	CHECK(!msg_bridge_attached());
++	CHECK(!msg_bridge_suppress_auto_ack() && msg_bridge_local_store());
++	msg_bridge_on_rx(pkt, -80);
++	CHECK(host_read(ev, 8) == 0);
++
++	// HELLO attaches and is answered with version, mode, caps, call.
++	size_t n = msg_link_encode_hello(f, sizeof f);
++	msg_bridge_feed(f, n, 1000);
++	CHECK(msg_bridge_attached() && msg_bridge_suppress_auto_ack() && msg_bridge_local_store());
++	CHECK(host_read(ev, 8) == 1);
++	CHECK(ev[0].kind == MSG_LINK_EVENT_HELLO && ev[0].version == MSG_LINK_VERSION);
++	CHECK(ev[0].mode == MSG_LINK_MODE_DEFAULT && ev[0].caps == (MSG_LINK_CAP_TX | MSG_LINK_CAP_LBT));
++	CHECK(strcmp(ev[0].call, "RT880") == 0);
++
++	// SET_CALL reaches the board; SET_MODE without STORE stops local filing.
++	n = msg_link_encode_set_call(f, sizeof f, "SV4QXF");
++	msg_bridge_feed(f, n, 1100);
++	CHECK(strcmp(board_call, "SV4QXF") == 0);
++	n = msg_link_encode_set_mode(f, sizeof f, MSG_LINK_MODE_BRIDGE);
++	msg_bridge_feed(f, n, 1200);
++	CHECK(!msg_bridge_local_store());
++	CHECK(host_read(ev, 8) == 1 && ev[0].kind == MSG_LINK_EVENT_HELLO && strcmp(ev[0].call, "SV4QXF") == 0);
++
++	// Received frames go to the host with their RSSI, byte for byte.
++	msg_bridge_on_rx(pkt, -97);
++	CHECK(host_read(ev, 8) == 1);
++	CHECK(ev[0].kind == MSG_LINK_EVENT_RX && ev[0].rssi == -97 && memcmp(ev[0].packet, pkt, sizeof pkt) == 0);
++
++	// A transmit request is validated and handed to the board; a second one while busy is QUEUE_FULL.
++	n = msg_link_encode_tx(f, sizeof f, pkt);
++	msg_bridge_feed(f, n, 1300);
++	CHECK(board_tx_count == 1 && memcmp(board_tx, pkt, sizeof pkt) == 0);
++	msg_bridge_feed(f, n, 1310);
++	CHECK(board_tx_count == 1);
++	CHECK(host_read(ev, 8) == 1 && ev[0].kind == MSG_LINK_EVENT_TX_RESULT && ev[0].result == MSG_LINK_TX_QUEUE_FULL);
++	board_tx_busy = false;
++	msg_bridge_on_tx_done(pkt, MSG_LINK_TX_OK);
++	CHECK(host_read(ev, 8) == 1);
++	CHECK(ev[0].kind == MSG_LINK_EVENT_TX_RESULT && ev[0].tx_id == 0x0102 && ev[0].tx_type == MSG_PKT_TYPE_TEXT);
++	CHECK(ev[0].result == MSG_LINK_TX_OK);
++
++	// A corrupted packet is refused with BAD_PACKET and never reaches the board.
++	uint8_t bad[MSG_PKT_WIRE_LEN];
++	memcpy(bad, pkt, sizeof bad);
++	bad[30] ^= 0x40;
++	n = msg_link_encode_tx(f, sizeof f, bad);
++	msg_bridge_feed(f, n, 1400);
++	CHECK(board_tx_count == 1);
++	CHECK(host_read(ev, 8) == 1 && ev[0].kind == MSG_LINK_EVENT_ERROR && ev[0].error == MSG_LINK_ERR_BAD_PACKET);
++
++	// Byte-at-a-time feeding (a UART ISR) works the same.
++	n = msg_link_encode_keepalive(f, sizeof f);
++	for (size_t i = 0; i < n; i++) {
++		msg_bridge_feed(&f[i], 1, 5000);
++	}
++	CHECK(host_read(ev, 8) == 0);
++
++	// The output never splits a frame: a too-small read gets nothing, a big one gets whole frames.
++	msg_bridge_on_rx(pkt, -50);
++	uint8_t small[20];
++	CHECK(msg_bridge_output(small, sizeof small) == 0);
++	CHECK(host_read(ev, 8) == 1 && ev[0].kind == MSG_LINK_EVENT_RX);
++
++	// A full queue drops (and counts) instead of corrupting.
++	for (int i = 0; i < 20; i++) {
++		msg_bridge_on_rx(pkt, -60);
++	}
++	CHECK(msg_bridge_dropped() > 0);
++	int got = host_read(ev, 8);
++	CHECK(got >= 3);
++	for (int i = 0; i < got; i++) {
++		CHECK(ev[i].kind == MSG_LINK_EVENT_RX && memcmp(ev[i].packet, pkt, sizeof pkt) == 0);
++	}
++
++	// Silence for longer than the timeout detaches: the radio goes back to standalone behavior.
++	msg_bridge_tick(5000 + MSG_LINK_TIMEOUT_MS - 1);
++	CHECK(msg_bridge_attached());
++	msg_bridge_tick(5000 + MSG_LINK_TIMEOUT_MS + 1);
++	CHECK(!msg_bridge_attached() && !msg_bridge_suppress_auto_ack() && msg_bridge_local_store());
++
++	// Frames for another KISS port (an APRS TNC on port 0) are not the bridge's.
++	uint8_t other[MSG_LINK_FRAME_MAX];
++	n = msg_kiss_encode(other, sizeof other, 0x00, NULL, 0, pkt, sizeof pkt);
++	msg_bridge_feed(other, n, 30000);
++	CHECK(!msg_bridge_attached() && board_tx_count == 1);
++}
++
++int main(void)
++{
++	test_kiss();
++	test_bridge();
++	if (failures) {
++		printf("msg_link test: %d failure(s)\n", failures);
++		return 1;
++	}
++	printf("msg_link test: OK (KISS round-trip/escape/errors, HELLO/SET_CALL/SET_MODE, RX events, TX + QUEUE_FULL, "
++		"BAD_PACKET, whole-frame output, overflow, timeout, foreign port)\n");
++	return 0;
++}
+diff --git a/core/messenger/tests/msg_mesh_test.c b/core/messenger/tests/msg_mesh_test.c
+new file mode 100644
+index 0000000..a43d8df
+--- /dev/null
++++ b/core/messenger/tests/msg_mesh_test.c
+@@ -0,0 +1,259 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// Host test: a simulated network of mesh nodes on one shared channel. Each node hears only the nodes in its range
++// table; a frame sent at time t arrives at t + AIR_MS. Checks relaying, dedup, ACKs over relays, retries and
++// suppression.
++#include <stdio.h>
++#include <string.h>
++#include "messenger/msg_mesh.h"
++
++static int failures;
++#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } } while (0)
++
++#define NODES	4
++#define AIR_MS	900u
++#define QMAX	64
++
++typedef struct {
++	int idx;
++	msg_mesh_t mesh;
++	int delivered;
++	char last_text[MSG_TEXT_LEN + 1];
++	char last_from[MSG_CALLSIGN_LEN + 1];
++	uint8_t last_hops;
++	msg_mesh_status_t last_status;
++	uint16_t last_status_id;
++	int sent;
++} node_t;
++
++static node_t nodes[NODES];
++static bool hears[NODES][NODES];	// hears[a][b]: a receives what b sends
++static uint32_t now;
++static uint32_t rng = 12345;
++static int drop_next_from = -1;	// drop the next frame this node sends (nobody hears it)
++
++typedef struct { uint8_t pkt[MSG_PKT_WIRE_LEN]; int src; uint32_t at; } air_t;
++static air_t air[QMAX];
++static int air_n;
++
++static uint32_t fake_rand(void *ctx)
++{
++	(void)ctx;
++	rng = rng * 1103515245u + 12345u;
++	return rng >> 8;
++}
++
++static void on_send(void *ctx, const uint8_t p[MSG_PKT_WIRE_LEN])
++{
++	node_t *n = ctx;
++	n->sent++;
++	if (drop_next_from == n->idx) {
++		drop_next_from = -1;
++		return;
++	}
++	if (air_n < QMAX) {
++		memcpy(air[air_n].pkt, p, MSG_PKT_WIRE_LEN);
++		air[air_n].src = n->idx;
++		air[air_n].at = now + AIR_MS;
++		air_n++;
++	}
++}
++
++static void on_deliver(void *ctx, const msg_packet_t *p, int8_t rssi, uint8_t hops)
++{
++	(void)rssi;
++	node_t *n = ctx;
++	n->delivered++;
++	strcpy(n->last_text, (const char *)p->payload);
++	strcpy(n->last_from, p->from);
++	n->last_hops = hops;
++}
++
++static void on_status(void *ctx, uint16_t id, msg_mesh_status_t st)
++{
++	node_t *n = ctx;
++	n->last_status = st;
++	n->last_status_id = id;
++}
++
++static void setup(const char *const *calls, int count)
++{
++	memset(nodes, 0, sizeof nodes);
++	memset(hears, 0, sizeof hears);
++	air_n = 0;
++	now = 1000;
++	for (int i = 0; i < count; i++) {
++		nodes[i].idx = i;
++		msg_mesh_cfg_t cfg;
++		msg_mesh_default_cfg(&cfg, calls[i]);
++		msg_mesh_ops_t ops = { .send = on_send, .deliver = on_deliver, .status = on_status, .rand = fake_rand,
++			.ctx = &nodes[i] };
++		msg_mesh_init(&nodes[i].mesh, &cfg, &ops);
++	}
++}
++
++static void link(int a, int b)
++{
++	hears[a][b] = hears[b][a] = true;
++}
++
++// Advance simulated time in 10 ms steps, delivering frames and running timers.
++static void run(uint32_t ms, int count)
++{
++	for (uint32_t t = 0; t < ms; t += 10) {
++		now += 10;
++		for (int i = 0; i < air_n;) {
++			if ((int32_t)(now - air[i].at) >= 0) {
++				air_t f = air[i];
++				memmove(&air[i], &air[i + 1], (size_t)(air_n - i - 1) * sizeof air[0]);
++				air_n--;
++				for (int r = 0; r < count; r++) {
++					if (r != f.src && hears[r][f.src]) {
++						msg_mesh_on_rx(&nodes[r].mesh, f.pkt, -90, now);
++					}
++				}
++			} else {
++				i++;
++			}
++		}
++		for (int i = 0; i < count; i++) {
++			msg_mesh_tick(&nodes[i].mesh, now);
++		}
++	}
++}
++
++// A - B - C in a line: A and C can't hear each other.
++static void test_direct_over_relay(void)
++{
++	const char *calls[] = { "AAA", "BBB", "CCC" };
++	setup(calls, 3);
++	link(0, 1);
++	link(1, 2);
++	uint16_t id;
++	CHECK(msg_mesh_send_text(&nodes[0].mesh, "CCC", "hello C", now, &id));
++	run(20000, 3);
++	CHECK(nodes[2].delivered == 1 && strcmp(nodes[2].last_text, "hello C") == 0);
++	CHECK(strcmp(nodes[2].last_from, "AAA") == 0 && nodes[2].last_hops == 1);
++	CHECK(nodes[1].delivered == 0);			// B relays but a message to C isn't B's
++	CHECK(nodes[0].last_status == MSG_MESH_ST_ACKED && nodes[0].last_status_id == id);
++	CHECK(nodes[1].mesh.relayed == 2);		// the TEXT one way and the ACK back
++	CHECK(nodes[0].sent == 1);			// no retry was needed
++}
++
++// Broadcast in a line: everyone gets it exactly once; A's neighbor ACKs it, the far node doesn't.
++static void test_broadcast(void)
++{
++	const char *calls[] = { "AAA", "BBB", "CCC" };
++	setup(calls, 3);
++	link(0, 1);
++	link(1, 2);
++	CHECK(msg_mesh_send_text(&nodes[0].mesh, NULL, "to all", now, NULL));
++	run(20000, 3);
++	CHECK(nodes[1].delivered == 1 && nodes[2].delivered == 1);
++	CHECK(nodes[2].last_hops == 1);
++	CHECK(nodes[0].last_status == MSG_MESH_ST_ACKED);	// B's first-hand ACK
++	// C heard it relayed (TTL 3 -> 2): no ACK from C, only its own relay hop (2 -> 1).
++	CHECK(nodes[2].sent == 1 && nodes[2].mesh.relayed == 1);
++}
++
++// The first copy of the TEXT is lost: A retries, C gets it once.
++static void test_retry(void)
++{
++	const char *calls[] = { "AAA", "BBB" };
++	setup(calls, 2);
++	link(0, 1);
++	drop_next_from = 0;
++	CHECK(msg_mesh_send_text(&nodes[0].mesh, "BBB", "again", now, NULL));
++	run(30000, 2);
++	CHECK(nodes[1].delivered == 1);
++	CHECK(nodes[0].sent == 2);
++	CHECK(nodes[0].last_status == MSG_MESH_ST_ACKED);
++}
++
++// The ACK is lost: A retries, B dedups (no second delivery) but ACKs again.
++static void test_lost_ack(void)
++{
++	const char *calls[] = { "AAA", "BBB" };
++	setup(calls, 2);
++	link(0, 1);
++	CHECK(msg_mesh_send_text(&nodes[0].mesh, "BBB", "ack lost", now, NULL));
++	run(500, 2);
++	drop_next_from = 1;				// B's first ACK goes nowhere
++	run(30000, 2);
++	CHECK(nodes[1].delivered == 1);
++	CHECK(nodes[1].mesh.duplicates == 1);
++	CHECK(nodes[0].last_status == MSG_MESH_ST_ACKED);
++}
++
++// Nobody there: a direct message ends FAILED after 1 + retries tries.
++static void test_failed(void)
++{
++	const char *calls[] = { "AAA", "BBB" };
++	setup(calls, 2);
++	CHECK(msg_mesh_send_text(&nodes[0].mesh, "BBB", "anyone?", now, NULL));
++	run(60000, 2);
++	CHECK(nodes[0].sent == 3 && nodes[0].last_status == MSG_MESH_ST_FAILED);
++}
++
++// A diamond A - {B, C} - D: B and C both hear A's broadcast; usually whichever relays first suppresses the other.
++// D must deliver exactly once every time; over many random seeds, suppression must save a burst most of the time.
++static void test_suppression(void)
++{
++	const char *calls[] = { "AAA", "BBB", "CCC", "DDD" };
++	int saved = 0;
++	for (uint32_t seed = 1; seed <= 40; seed++) {
++		rng = seed * 7919u;
++		setup(calls, 4);
++		link(0, 1);
++		link(0, 2);
++		link(1, 2);
++		link(1, 3);
++		link(2, 3);
++		nodes[0].mesh.cfg.ttl = 2;		// one relay hop is enough here
++		nodes[0].mesh.cfg.ack_broadcast = false;
++		nodes[1].mesh.cfg.ack_broadcast = false;
++		nodes[2].mesh.cfg.ack_broadcast = false;
++		nodes[3].mesh.cfg.ack_broadcast = false;
++		CHECK(msg_mesh_send_text(&nodes[0].mesh, NULL, "diamond", now, NULL));
++		run(20000, 4);
++		CHECK(nodes[3].delivered == 1);
++		if (nodes[1].mesh.suppressed + nodes[2].mesh.suppressed >= 1) {
++			saved++;
++		}
++	}
++	printf("suppression saved a burst in %d of 40 runs\n", saved);
++	CHECK(saved >= 20);
++}
++
++// Malformed or own frames are ignored.
++static void test_ignore(void)
++{
++	const char *calls[] = { "AAA" };
++	setup(calls, 1);
++	uint8_t p[MSG_PKT_WIRE_LEN];
++	msg_packet_build_text(p, sizeof p, 7, "AAA", "me", 3);
++	msg_mesh_on_rx(&nodes[0].mesh, p, -50, now);
++	CHECK(nodes[0].delivered == 0 && nodes[0].sent == 0);
++	msg_packet_build_text(p, sizeof p, 8, "ZZZ", "x", 3);
++	p[40] ^= 1;
++	msg_mesh_on_rx(&nodes[0].mesh, p, -50, now);
++	CHECK(nodes[0].delivered == 0);
++}
++
++int main(void)
++{
++	test_direct_over_relay();
++	test_broadcast();
++	test_retry();
++	test_lost_ack();
++	test_failed();
++	test_suppression();
++	test_ignore();
++	if (failures) {
++		printf("msg_mesh test: %d failure(s)\n", failures);
++		return 1;
++	}
++	printf("msg_mesh test: OK (direct over a relay with ACK back, broadcast, retry, lost ACK, failure, "
++		"relay suppression, ignored frames)\n");
++	return 0;
++}
+diff --git a/docs/spec/messenger-link.md b/docs/spec/messenger-link.md
+new file mode 100644
+index 0000000..c9f8866
+--- /dev/null
++++ b/docs/spec/messenger-link.md
+@@ -0,0 +1,133 @@
++<!-- SPDX-License-Identifier: MIT -->
++<!-- Copyright (c) 2026 The RadioFoundry Authors -->
++
++# Messenger link: a GGM2 modem on a UART
++
++Version 1. Status: implemented and host-tested on both ends, not yet tried on hardware.
++
++A radio with a BK4819 FSK modem already sends and receives GGM2 frames (the GOGUFW-compatible analog messenger,
++[msg_packet.h](../../core/messenger/msg_packet.h)). The messenger link offers that modem to a host on the radio's UART, the
++one the programming cable uses. The host is usually a small ESP32 wired inside the radio, but a PC on a cable works
++too. With the link, the radio only moves GGM2 packets on and off the air. The host owns everything else: relaying,
++dedup, ACKs, retries, the message log, and the phone UI.
++
++The over-the-air format does not change. A radio with a host still talks to a plain GOGUFW radio, and the plain radio
++sees ordinary GGM2 TEXT and ACK frames.
++
++```
++phone ──WiFi/BLE──► ESP32 (mesh host) ──UART 38400 8N1──► radio MCU ──SPI──► BK4819 ──► 1200-baud FSK, GGM2
++```
++
++## 1. Framing
++
++The link uses KISS framing, the public TNC host protocol. `FEND 0xC0` starts and ends every frame. Inside a frame,
++`0xC0` is sent as `0xDB 0xDC` and `0xDB` as `0xDB 0xDD`. The first byte of a frame is the KISS command byte: the high
++nibble is the port and the low nibble is the command.
++
++The link uses **KISS port 1**. Port 0 stays free for an APRS TNC on radios that have one, so both can share the UART.
++A receiver ignores frames for other ports.
++
++| Command byte | Meaning |
++|---|---|
++| `0x10` | data (port 1, command 0): one GGM2 packet, host to radio |
++| `0x16` | SetHardware (port 1, command 6): control, followed by an op byte |
++
++## 2. Host to radio
++
++| Frame | Meaning |
++|---|---|
++| `0x10` + 94 bytes | Transmit this GGM2 packet on the current channel. The radio checks length, magic, version and CRC first. |
++| `0x16 0x01` + version | HELLO. The radio enters bridge mode with the default mode and answers with a HELLO reply. |
++| `0x16 0x02` + 1..8 bytes | SET_CALL: the radio's own callsign, for its UI and for any frame it builds itself. |
++| `0x16 0x03` | KEEPALIVE. Gets no reply. Every frame from the host counts as a keepalive. |
++| `0x16 0x04` + mode | SET_MODE. Answered with a HELLO reply. |
++
++Mode bits:
++
++| Bit | Name | When set |
++|---|---|---|
++| 0 | BRIDGE | The radio sends no ACK of its own for received TEXT. The host does it. |
++| 1 | STORE | The radio still files received TEXT in its own inbox, so its screen shows them. |
++
++HELLO sets BRIDGE and STORE.
++
++## 3. Radio to host
++
++| Frame | Meaning |
++|---|---|
++| `0x16 0x80` + rssi (int8, dBm) + 94 bytes | A valid GGM2 frame was received: the packet as it came off the air. |
++| `0x16 0x81` + version + mode + caps + call (8 bytes, zero padded) | HELLO reply. |
++| `0x16 0x82` + type + id (LE16) + result | Transmit result for a data frame. |
++| `0x16 0x8F` + op + error | Request refused. op is `0x10` for a data frame, otherwise the control op. |
++
++The radio reports every valid frame, whatever its type or destination. Filtering is the host's job.
++
++Capability bits: `0x01` TX (the radio can transmit here) and `0x02` LBT (it waits for a clear channel before keying
++up).
++
++Transmit results: `0` OK, `1` BUSY (the channel stayed busy), `2` REFUSED (no TX here: out of a TX band, receive-only,
++TX inhibited), `3` QUEUE_FULL (a transmit is already pending: send again after its result), `4` TIMEOUT (the burst
++never finished).
++
++Errors: `1` BAD_PACKET, `2` BAD_OP, `3` BAD_LEN.
++
++## 4. Session
++
++1. The host sends HELLO until it gets a HELLO reply (every 3 s), then sends SET_CALL if the reply's callsign is not
++   its own.
++2. The host keeps one transmit in flight. It sends the next data frame only after the previous one's result, or 5 s
++   without a result. On QUEUE_FULL it retries after about 300 ms. On BUSY it retries a few times after a random 0.5 to
++   2 s.
++3. The host sends something at least every 5 s. It repeats HELLO every 30 s and treats a missing reply (3 s) as the
++   radio being gone.
++4. The radio leaves bridge mode after **15 s** with no frame from the host. It then ACKs and files messages on its own
++   again, so a host that crashes or loses power never leaves the radio deaf.
++5. While no host is attached, the radio queues nothing for it.
++
++The radio sends its output in whole frames only, so frames from different tasks never interleave on the wire. If its
++output queue is full, it drops a frame whole and counts it rather than truncating it.
++
++## 5. Mesh (host side)
++
++The host runs the mesh ([msg_mesh.h](../../core/messenger/msg_mesh.h)) on the plain GGM2 fields. It adds no new bytes.
++
++- A frame's identity is `(from, id, type)`, remembered for 120 s. A frame already seen is a duplicate.
++- `hops = ttl_init - ttl_remain`. A first-hand frame has `hops = 0`.
++- **TEXT to us:** delivered once and ACKed with `ttl = hops + 1`, so the ACK can travel back over the same number of
++  relays. A duplicate TEXT to us is ACKed again, because the sender is retrying and our first ACK may have been lost,
++  but it is not delivered twice.
++- **TEXT to ALL:** delivered once. It is ACKed with `ttl = 1` only when heard first-hand, which is what a plain GOGUFW
++  radio does. That ACK marks a broadcast as "heard by someone".
++- **Relay:** TEXT not addressed to us, and ACK not addressed to us, are forwarded while `ttl_remain > 1`. The copy
++  carries `ttl_remain - 1` (the CRC is recomputed) and goes out after a random delay of 200 ms plus a random slot of
++  1.2 s (4 slots) plus up to 99 ms of jitter. A slot is longer than one burst (about 0.9 s on air), so the earliest
++  relay is usually heard before the others fire. A node that hears another copy of a frame it is about to relay
++  cancels its own copy.
++- PING, PONG and WAKE are neighbor-only and never relayed.
++- **Own TEXT:** sent with `ttl = 3` by default, which is GOGUFW's default. A direct TEXT is retried twice (three tries
++  in all) with the same id until an ACK comes back. The ACK window is 3 s + 4.5 s per hop of budget, plus a random
++  0.2 to 0.8 s before each retry. A broadcast is not retried: after one window it is "no ack" unless some neighbor
++  ACKed it.
++- A direct TEXT carries the destination callsign in `to`. A plain GOGUFW radio shows any TEXT it receives, so direct
++  messages are private by convention only. Nothing on the air is encrypted.
++
++### What a plain GOGUFW radio sees
++
++- TEXT from a host node: an ordinary message (`to` = ALL or a callsign).
++- Relayed TEXT: the same message, once, with the original sender's callsign, because its `(from, id)` is unchanged.
++  Whether it suppresses the duplicate depends on its own dedup.
++- ACK with `ttl > 1`: an ordinary ACK.
++
++## 6. Timing at 1200 baud
++
++One GGM2 frame is 100 FIFO bytes plus a 16-byte preamble and sync, about 0.8 s, plus about 80 ms of keying and
++settling: about 0.9 s per burst. A direct message over one relay with its ACK back is four bursts plus two relay
++delays, typically 5 to 8 s.
++
++## 7. Not in version 1
++
++- Listen-before-talk on the radio side (the capability bit exists).
++- BLE transport on the host (WiFi access point and USB serial only for now).
++- Fragmentation of texts longer than 64 bytes.
++- Any encryption. On amateur bands, encryption that obscures meaning is not allowed, so if it ever appears it must be
++  opt-in and off by default.
+-- 
+2.43.0
+

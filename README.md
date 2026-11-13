@@ -94,3 +94,19 @@ GET /api/messages
 ## ⚖️ Άδεια
 
 MIT License © 2026 xsystemgr
+
+---
+
+## 🔌 Λειτουργία UART (ESP32 μέσα στον ασύρματο)
+
+Δεύτερος τρόπος λειτουργίας, χωρίς audio modem: ο ασύρματος (BK4819) κάνει το FSK στο hardware και το ESP32
+μιλάει με το MCU του μέσω UART. Στον αέρα παίζει το GGM2 του GOGUFW, άρα υπάρχει συμβατότητα με UV-K1/K5 που τρέχουν
+GOGUFW. Το mesh (dedup, relay, ACK, retries) τρέχει στο ESP32.
+
+- Πρωτόκολλο: [docs/bridge-protocol.md](docs/bridge-protocol.md) (KISS port 1)
+- Portable C core + host tests: [`messenger/`](messenger/), περιγραφή στο [docs/gogu-messenger-core.md](docs/gogu-messenger-core.md)
+- Firmware ESP32 (Seeed XIAO ESP32-C3, PlatformIO): [`esp32/ggm_bridge/`](esp32/ggm_bridge/)
+- RT-880 (RadioFoundry_QXF): [`patches/radiofoundry-rt880-messenger-link.patch`](patches/radiofoundry-rt880-messenger-link.patch)
+
+Κατάσταση: host tests περνάνε, το ESP32 firmware κάνει compile, το RT-880 image κάνει build. Δεν έχει δοκιμαστεί σε
+hardware· ο UART driver του RT-880 είναι ακόμα stub.
